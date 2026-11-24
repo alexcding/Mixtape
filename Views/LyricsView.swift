@@ -1,4 +1,6 @@
+#if !IOS18_COMPAT
 import FoundationModels
+#endif
 import SwiftUI
 import FactoryKit
 import os
@@ -12,6 +14,7 @@ struct LyricsView: View {
     @State private var isLoading = false
     @State private var lastLoadedVideoId: String?
 
+#if !IOS18_COMPAT
     // AI explanation state
     @State private var lyricsSummary: LyricsSummary?
     @State private var partialSummary: LyricsSummary.PartiallyGenerated?
@@ -19,6 +22,7 @@ struct LyricsView: View {
     @State private var showExplanation = false
     @State private var explanationError: String?
 
+#endif
     private let logger = DiagnosticsLogger.ai
 
     var body: some View {
@@ -34,11 +38,13 @@ struct LyricsView: View {
         #endif
         .onChange(of: playerManager.currentTrack?.videoId) { _, newVideoId in
             if let videoId = newVideoId, videoId != lastLoadedVideoId {
+#if !IOS18_COMPAT
                 // Reset explanation when track changes
                 self.lyricsSummary = nil
                 self.partialSummary = nil
                 self.showExplanation = false
                 self.explanationError = nil
+#endif
                 Task {
                     await self.loadLyrics(for: videoId)
                 }
@@ -118,6 +124,7 @@ struct LyricsView: View {
         .scrollContentBackground(.hidden)
     }
 
+#if !IOS18_COMPAT
     private func explanationSection(_ summary: LyricsSummary) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             // Mood
@@ -216,6 +223,7 @@ struct LyricsView: View {
         .background(.purple.opacity(0.05))
     }
 
+#endif
     private var noLyricsView: some View {
         VStack(spacing: 12) {
             Image(systemName: "music.note")

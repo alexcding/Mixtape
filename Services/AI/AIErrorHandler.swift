@@ -8,6 +8,7 @@ import os
 ///
 /// These errors provide actionable messages that can be displayed directly to users,
 /// along with suggestions for recovery.
+@available(iOS 26.0, *)
 enum AIError: LocalizedError {
     /// The request was too complex or exceeded token limits.
     case contextWindowExceeded
@@ -95,6 +96,7 @@ enum AIError: LocalizedError {
 ///     }
 /// }
 /// ```
+@available(iOS 26.0, *)
 enum AIErrorHandler {
     private static let logger = DiagnosticsLogger.ai
 

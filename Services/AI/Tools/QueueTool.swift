@@ -5,6 +5,7 @@ import os
 /// A tool that provides the current playback queue context to the language model.
 /// This allows AI to understand what's in the queue before making changes.
 @MainActor
+@available(iOS 26.0, *)
 struct QueueTool: Tool {
     /// The PlayerManager used to access queue state.
     private let playerManager: PlayerManager

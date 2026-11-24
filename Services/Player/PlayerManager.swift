@@ -13,7 +13,7 @@ import AVFoundation
 
 // MARK: - PlayerManager
 
-/// Controls music playback via a hidden WKWebView.
+/// Controls the queue, native playback and the optional Web compatibility player.
 @MainActor
 @Observable
 final class PlayerManager: NSObject, PlayerManagerProtocol {
@@ -317,8 +317,14 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
 
         self.logger.info("Player switched to: \(type(of: newPlayer))")
 
-        // If we had a track playing, reload it on the new player
-        if let videoId = currentVideoId, wasPlaying {
+        // For iOS Web Player, the browser must exist and be interactive
+        // before playback can start. It also works after the native player failed.
+        if playerType == .webView, let videoId = currentVideoId {
+            pendingPlayVideoId = videoId
+            hasUserInteractedThisSession = false
+            showMiniPlayer = true
+            self.logger.info("Presenting interactive Web Player for selected track")
+        } else if let videoId = currentVideoId, wasPlaying {
             self.logger.info("Reloading current track on new player")
             await newPlayer.loadVideo(videoId: videoId)
         }
@@ -338,31 +344,52 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
     private func setupPlayerCallbacks() {
         guard let player = audioPlayer else { return }
 
-        player.onPlaybackUpdate = { [weak self] isPlaying, currentTime, duration in
-            self?.updatePlaybackState(isPlaying: isPlaying, progress: currentTime, duration: duration)
+        player.onPlaybackUpdate = { [weak self, weak player] isPlaying, currentTime, duration in
+            guard let self, let player, self.audioPlayer === player else { return }
+            self.updatePlaybackState(isPlaying: isPlaying, progress: currentTime, duration: duration)
         }
 
-        player.onTrackEnded = { [weak self] in
+        player.onTrackEnded = { [weak self, weak player] in
             Task { @MainActor in
-                await self?.handleTrackEnded()
+                guard let self, let player, self.audioPlayer === player else { return }
+                await self.handleTrackEnded()
             }
         }
 
-        player.onLikeStatusChanged = { [weak self] status in
-            self?.updateLikeStatus(status)
+        player.onLikeStatusChanged = { [weak self, weak player] status in
+            guard let self, let player, self.audioPlayer === player else { return }
+            self.updateLikeStatus(status)
         }
 
-        player.onError = { [weak self] error in
-            self?.logger.error("Audio player error: \(error.localizedDescription)")
-            self?.state = .error(error.localizedDescription)
+        player.onError = { [weak self, weak player] error in
+            guard let self, let player, self.audioPlayer === player else { return }
+            let nsError = error as NSError
+            let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+            let underlyingDetails = underlying.map { " | underlying: \($0.domain):\($0.code)" } ?? ""
+            let details = "\(error.localizedDescription) [\(nsError.domain):\(nsError.code)]\(underlyingDetails)"
+            self.logger.error("Audio player error: \(details)")
+            if self.currentPlayerType == .native,
+               !self.isPlayingOffline,
+               let videoId = self.currentTrack?.videoId {
+                Task { @MainActor [weak self] in
+                    await self?.fallbackToWebForCurrentTrack(
+                        videoId: videoId,
+                        reason: details
+                    )
+                }
+            } else {
+                self.state = .error(details)
+            }
         }
 
-        player.onAudioQualityChanged = { [weak self] bitrateKbps, codec in
-            self?.updateAudioQuality(bitrateKbps: bitrateKbps, codec: codec)
+        player.onAudioQualityChanged = { [weak self, weak player] bitrateKbps, codec in
+            guard let self, let player, self.audioPlayer === player else { return }
+            self.updateAudioQuality(bitrateKbps: bitrateKbps, codec: codec)
         }
 
-        player.onStateChange = { [weak self] playerState in
-            self?.handlePlayerStateChange(playerState)
+        player.onStateChange = { [weak self, weak player] playerState in
+            guard let self, let player, self.audioPlayer === player else { return }
+            self.handlePlayerStateChange(playerState)
         }
 
         // Set initial volume on player
@@ -429,11 +456,142 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
 
     // MARK: - Public Methods
 
+    /// Initialize the Web compatibility engine only when explicitly requested.
+    private func prepareWebPlayerForOnlineTrack() {
+        let webPlayer = Container.shared.ytMusicWebPlayer()
+        _ = SingletonPlayerWebView.shared.getWebView(
+            webKitManager: Container.shared.webKitManager(),
+            playerManager: self
+        )
+        if self.audioPlayer !== webPlayer {
+            self.audioPlayer?.stop()
+            self.audioPlayer = webPlayer
+            setupPlayerCallbacks()
+        }
+    }
+
+    /// Avoid repeated Web fallbacks for a single native stream attempt.
+    private var attemptedWebFallbackForCurrentTrack = false
+
+    private func preparePreferredOnlinePlayer() {
+        let mode = UserDefaults.standard.string(forKey: "mixtape.ios18.streamingMode") ?? "audio"
+        // Existing "auto" preferences also use native audio on Wi-Fi and mobile.
+        let preferNativeAudio = mode != "web"
+        if preferNativeAudio {
+            let nativePlayer = Container.shared.ytMusicNativePlayer()
+            if self.audioPlayer !== nativePlayer {
+                self.audioPlayer?.stop()
+                self.audioPlayer = nativePlayer
+                setupPlayerCallbacks()
+            }
+            logger.info("Audio-only streaming selected for online track")
+        } else {
+            prepareWebPlayerForOnlineTrack()
+        }
+    }
+
+    /// Retain the same track/queue when a direct audio CDN URL fails.
+    /// The WebView is initialized only on demand; never start a second player.
+    private func fallbackToWebForCurrentTrack(videoId: String, reason: String) async {
+        guard !isPlayingOffline,
+              currentTrack?.videoId == videoId,
+              currentPlayerType == .native,
+              !attemptedWebFallbackForCurrentTrack else { return }
+        attemptedWebFallbackForCurrentTrack = true
+        // Never store signed CDN URLs in the diagnostic displayed to the user.
+        let safeReason = reason.replacingOccurrences(
+            of: #"https?://[^\s]+"#, with: "[URL]", options: .regularExpression
+        )
+        UserDefaults.standard.set(
+            String(safeReason.prefix(900)), forKey: "mixtape.ios18.lastNativeFallback"
+        )
+        let wantsPlayback = (audioPlayer as? YTMusicNativePlayer)?.wantsPlayback ?? !isPaused
+        let fallbackEnabled = UserDefaults.standard.object(forKey: "mixtape.ios18.allowWebFallback") as? Bool ?? true
+        if !fallbackEnabled || !wantsPlayback {
+            audioPlayer?.stop()
+            logger.warning("Native streaming failed; preserving the selected playback policy and pause intent")
+            isTransitioningTrack = false
+            isPaused = true
+            state = .error("Native audio unavailable. See Settings > Audio diagnostics.")
+            return
+        }
+        logger.warning("Audio-only failed for \(videoId): \(reason); switching SAME track to Web")
+        prepareWebPlayerForOnlineTrack()
+        isPaused = false
+        isTransitioningTrack = true
+        state = .loading
+        pendingPlayVideoId = videoId
+        progress = 0
+        duration = 0
+        if !hasUserInteractedThisSession {
+            // Use the same first-play WebView consent path as normal Web playback.
+            showMiniPlayer = true
+        } else {
+            showMiniPlayer = false
+            await audioPlayer?.loadVideo(videoId: videoId)
+        }
+    }
+
+    @ObservationIgnored private var nativeAudioWatchdogTask: Task<Void, Never>?
+    private var nativeAudioWatchdogToken = UUID()
+
+    /// Detect both a blocked first load and a stream that stops progressing later.
+    /// Pausing and seeking reset the budget; only the current request may recover.
+    private func scheduleNativeAudioWatchdog(videoId: String) {
+        nativeAudioWatchdogTask?.cancel()
+        guard currentPlayerType == .native else { return }
+        let token = UUID()
+        nativeAudioWatchdogToken = token
+        nativeAudioWatchdogTask = Task { @MainActor [weak self] in
+            var discoveryStartedAt: Date? = Date()
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(10)) }
+                catch { return }
+                guard let self, self.nativeAudioWatchdogToken == token,
+                      self.currentTrack?.videoId == videoId,
+                      !self.isPlayingOffline,
+                      let native = self.audioPlayer as? YTMusicNativePlayer else { return }
+                guard native.wantsPlayback else {
+                    discoveryStartedAt = Date()
+                    continue
+                }
+                if native.isResolvingStream {
+                    if discoveryStartedAt == nil { discoveryStartedAt = Date() }
+                    if Date().timeIntervalSince(discoveryStartedAt!) < 120 { continue }
+                    await self.fallbackToWebForCurrentTrack(
+                        videoId: videoId, reason: "Native audio discovery exceeded 120 seconds"
+                    )
+                    return
+                }
+                discoveryStartedAt = nil
+                guard let lastProgress = native.lastPlaybackProgressAt ?? native.nativeStreamFetchCompletedAt,
+                      Date().timeIntervalSince(lastProgress) >= 35 else { continue }
+                MixtapeNativeAudioTrace.add("watchdog: native audio stopped progressing")
+                await self.fallbackToWebForCurrentTrack(
+                    videoId: videoId, reason: "Native audio made no progress for 35 seconds"
+                )
+                return
+            }
+        }
+    }
+
     /// Plays a track by video ID.
     func play(videoId: String) async {
+        // Reuse saved metadata when the selected ID is available offline.
+        if let saved = Container.shared.downloadManager().downloads.first(where: { $0.id == videoId }) {
+            await play(song: saved.song)
+            return
+        }
+        attemptedWebFallbackForCurrentTrack = false
+        preparePreferredOnlinePlayer()
         self.logger.info("Playing video: \(videoId) [type: \(self.currentPlayerType.name)]")
         self.isPaused = false
         self.isTransitioningTrack = true
+        self.isPlayingOffline = false
+        self.progress = 0
+        self.duration = 0
+        self.seekingProgress = nil
+        self.resetTrackStatus()
         self.state = .loading
 
         // Create a minimal Song object for now
@@ -458,7 +616,8 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
             self.logger.info("Showing mini player for first-time user interaction")
         } else {
             self.showMiniPlayer = false
-            // Load the video directly via audio player
+            // A stalled native fetch must not leave this song loading indefinitely.
+            scheduleNativeAudioWatchdog(videoId: videoId)
             await audioPlayer?.loadVideo(videoId: videoId)
         }
 
@@ -473,6 +632,7 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
         // Check for offline download — play locally
         let downloadManager = Container.shared.downloadManager()
         if let fileURL = downloadManager.localFileURL(for: song.videoId) {
+            // Playback never modifies downloaded music.
             let isOpus = fileURL.pathExtension == "opus"
             if isOpus {
                 self.logger.info("Playing offline Opus file for: \(song.title)")
@@ -484,6 +644,11 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
             }
             return
         }
+
+        // Uncached tracks use the selected streaming mode; local tracks above
+        // remain completely offline and continue to use native/VLC.
+        attemptedWebFallbackForCurrentTrack = false
+        preparePreferredOnlinePlayer()
 
         self.isPaused = false
         self.isTransitioningTrack = true
@@ -524,6 +689,7 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
             self.logger.info("Showing mini player for first-time user interaction")
         } else {
             self.showMiniPlayer = false
+            scheduleNativeAudioWatchdog(videoId: song.videoId)
             await audioPlayer?.loadVideo(videoId: song.videoId)
         }
 
@@ -633,7 +799,13 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
         let previousProgress = self.progress
         self.progress = progress
         self.duration = duration
-        
+
+        // Hide Web UI only after media has actually started.
+        // The user may reopen it without an automatic re-hide.
+        if isPlaying, currentPlayerType == .webView,
+           showMiniPlayer, !hasUserInteractedThisSession {
+            confirmPlaybackStarted()
+        }
         // Update Now Playing info with current playback state and elapsed time
         if let currentTrack = self.currentTrack {
             self.updateNowPlayingInfo(title: currentTrack.title, artist: currentTrack.artistsDisplay)
@@ -863,7 +1035,11 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
     func resume() async {
         self.logger.debug("Resuming playback")
         self.isPaused = false
-        audioPlayer?.play()
+        if case .error = state, let currentTrack {
+            await play(song: currentTrack)
+        } else {
+            audioPlayer?.play()
+        }
     }
 
     /// Skips to next track.
@@ -1029,7 +1205,14 @@ final class PlayerManager: NSObject, PlayerManagerProtocol {
     /// Stops playback and clears state.
     func stop() async {
         self.logger.debug("Stopping playback")
-        await self.evaluatePlayerCommand("pauseVideo()")
+        nativeAudioWatchdogTask?.cancel()
+        nativeAudioWatchdogTask = nil
+        nativeAudioWatchdogToken = UUID()
+        audioPlayer?.stop()
+        pendingPlayVideoId = nil
+        showMiniPlayer = false
+        isPlayingOffline = false
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         self.isPaused = true
         self.isTransitioningTrack = false
         self.state = .idle

@@ -32,6 +32,10 @@ final class PlayerViewModel {
     // MARK: - Computed Properties
 
     var currentTrack: Song? { playerManager.currentTrack }
+    var playbackError: String? {
+        if case let .error(message) = playerManager.state { return message }
+        return nil
+    }
     var currentWebTrack: Song? { playerManager.currentWebTrack }
     var isPlaying: Bool { playerManager.isPlaying  }
     var progress: Double { playerManager.displayProgress }
@@ -136,6 +140,11 @@ final class PlayerViewModel {
     }
 
     // MARK: - Actions
+
+    func revealWebPlayer() {
+        guard currentPlayerType == .webView else { return }
+        playerManager.showMiniPlayer = true
+    }
 
     func playPause() {
         playerTask = Task {

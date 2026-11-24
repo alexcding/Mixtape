@@ -44,7 +44,7 @@ struct InlineLargeTitleModifier<TrailingContent: View>: ViewModifier {
             }
             .navigationTitle(isHidden ? "" : title)
             .toolbar { toolbarContent(animated: true) }
-            .toolbarTitleDisplayMode(.inlineLarge)
+            .toolbarTitleDisplayMode(.large)
             .animation(.easeInOut(duration: 0.2), value: isHidden)
     }
 
@@ -53,7 +53,7 @@ struct InlineLargeTitleModifier<TrailingContent: View>: ViewModifier {
         content
             .navigationTitle(title)
             .toolbar { toolbarContent(animated: false) }
-            .toolbarTitleDisplayMode(.inlineLarge)
+            .toolbarTitleDisplayMode(.large)
     }
 
     @ToolbarContentBuilder

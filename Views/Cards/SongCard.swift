@@ -12,6 +12,10 @@ struct SongCard: View {
             thumbnail
             titleAndSubtitle
         }
+        .contextMenu {
+            DownloadContextMenuItems(song: song)
+            MixtapeQuickAddMenu(song: song)
+        }
     }
 
     // MARK: - Components

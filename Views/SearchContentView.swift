@@ -26,6 +26,7 @@ struct SearchContentView: View {
         ScrollView {
             self.contentView()
         }
+        .mixtapeScrollAbovePlayer()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay {
             switch self.viewModel.loadingState {
@@ -45,7 +46,7 @@ struct SearchContentView: View {
         }
         .animation(.none, value: self.viewModel.loadingState)
         .contentTransition(.identity)
-        .safeAreaBar(edge: .top) {
+        .safeAreaInset(edge: .top) {
             if !self.viewModel.results.isEmpty {
                 self.filterChips()
                     .padding(.horizontal, Layout.horizontalPadding)
@@ -267,6 +268,10 @@ struct SearchContentView: View {
         } label: {
             Label("Add to Library", systemImage: "plus.circle")
         }
+
+        Divider()
+        DownloadContextMenuItems(song: song)
+        MixtapeQuickAddMenu(song: song)
     }
 
     @ViewBuilder

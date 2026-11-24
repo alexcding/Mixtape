@@ -1,0 +1,237 @@
+name: Mixtape - Appetize - Xcode 26.2 (ARM macro fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      BUILD_ROOT: ${{ github.workspace }}/build-xcode-26-2-clean
+      DERIVED_DATA: ${{ github.workspace }}/build-xcode-26-2-clean/DerivedData
+      SPM_SOURCES: ${{ github.workspace }}/build-xcode-26-2-clean/SourcePackages
+      LOG_DIR: ${{ github.workspace }}/build-xcode-26-2-clean/logs
+
+    steps:
+      - name: Checkout Mixtape
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.2 (mandatory)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version > "$RUNNER_TEMP/xcode-version.txt"
+          cat "$RUNNER_TEMP/xcode-version.txt"
+          grep -Fxq 'Xcode 26.2' "$RUNNER_TEMP/xcode-version.txt"
+          xcrun --find swift
+          swift --version
+
+      - name: Verify native ARM64 host and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner architecture: $(uname -m)"
+          test "$(uname -m)" = 'arm64'
+          xcrun --sdk macosx --find swiftc
+          xcrun --sdk macosx swiftc -version
+          xcrun --sdk iphonesimulator --show-sdk-path
+          # The iOS Simulator destination is selected at build time;
+          # the compiler plugins still need to execute as macOS host programs.
+
+      - name: Allow trusted Swift package macros in CI (noninteractive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GitHub Actions is non-interactive: Xcode cannot show its trust prompt.
+          # Only enable this for trusted, reviewed Swift package dependencies.
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults read com.apple.dt.Xcode IDESkipMacroFingerprintValidation
+
+      - name: Create completely fresh build folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$BUILD_ROOT"
+          mkdir -p "$DERIVED_DATA" "$SPM_SOURCES" "$LOG_DIR"
+          xcodebuild -version > "$LOG_DIR/xcode-version.txt"
+          xcodebuild -showsdks > "$LOG_DIR/sdks.txt"
+          xcodebuild -list -project Mixtape.xcodeproj > "$LOG_DIR/project-schemes.txt" 2>&1
+
+      - name: Set iOS 26.0 for Mixtape only (not Swift packages)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          project = Path("Mixtape.xcodeproj/project.pbxproj")
+          content = project.read_text(encoding="utf-8")
+          old = "IPHONEOS_DEPLOYMENT_TARGET = 26.1;"
+          matches = content.count(old)
+          if matches != 2:
+              raise SystemExit(f"Expected 2 Mixtape target settings, found {matches}; inspect project.pbxproj")
+          project.write_text(
+              content.replace(old, "IPHONEOS_DEPLOYMENT_TARGET = 26.0;"),
+              encoding="utf-8",
+          )
+          print("Mixtape target: iOS 26.0 in Debug and Release settings")
+          PYCODE
+          grep -n 'IPHONEOS_DEPLOYMENT_TARGET' Mixtape.xcodeproj/project.pbxproj
+
+      - name: Require swift-case-paths 1.10.0 (Xcode 26.2 macro compatibility test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          project = Path("Mixtape.xcodeproj/project.pbxproj")
+          content = project.read_text(encoding="utf-8")
+          pattern = (r'(repositoryURL = "https://github\.com/pointfreeco/swift-case-paths";'
+                     r'\s*requirement = \{\s*kind = upToNextMajorVersion;\s*'
+                     r'minimumVersion = )1\.7\.2(;\s*\};)')
+          updated, count = re.subn(pattern, r'\g<1>1.10.0\2', content)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one swift-case-paths 1.7.2 requirement; found {count}. Inspect project.pbxproj.")
+          project.write_text(updated, encoding="utf-8")
+          print("swift-case-paths minimum version now 1.10.0; Package.resolved will be checked after resolution.")
+          PYCODE
+          # Keep the old lockfile as evidence. Xcode should update its incompatible pin.
+          LOCKFILE="Mixtape.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          if [ -f "$LOCKFILE" ]; then cp "$LOCKFILE" "$LOG_DIR/Package.resolved.before"; fi
+
+      - name: Install required Carthage frameworks
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v carthage >/dev/null 2>&1; then brew install carthage; fi
+          carthage version | tee "$LOG_DIR/carthage-version.txt"
+          carthage bootstrap --use-xcframeworks --platform iOS 2>&1 | tee "$LOG_DIR/carthage.log"
+
+      - name: Resolve Swift packages in a fresh folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project Mixtape.xcodeproj \
+            -scheme Mixtape \
+            -clonedSourcePackagesDirPath "$SPM_SOURCES" \
+            2>&1 | tee "$LOG_DIR/swift-packages.log"
+
+      - name: Verify resolved CasePaths version and save lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json, shutil
+          path = Path('Mixtape.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved')
+          if not path.is_file():
+              raise SystemExit('Missing Package.resolved after SwiftPM resolution.')
+          data = json.loads(path.read_text(encoding='utf-8'))
+          pins = {pin['identity']: pin for pin in data.get('pins', [])}
+          package = pins.get('swift-case-paths')
+          if package is None:
+              raise SystemExit('swift-case-paths was not present in resolved dependencies')
+          version = package['state']['version']
+          print('Resolved swift-case-paths version:', version)
+          if tuple(int(x) for x in version.split('.')[:3]) < (1,10,0) or int(version.split('.')[0]) != 1:
+              raise SystemExit('Expected swift-case-paths version >= 1.10.0 and < 2.0.0')
+          shutil.copy2(path, Path('build-xcode-26-2-clean/logs/Package.resolved.after'))
+          PYCODE
+
+      - name: Build Mixtape for iOS Simulator (Xcode 26.2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Mixtape.xcodeproj \
+            -scheme Mixtape \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$DERIVED_DATA" \
+            -clonedSourcePackagesDirPath "$SPM_SOURCES" \
+            -jobs 2 \
+            -verbose \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$LOG_DIR/xcodebuild.log"
+
+      - name: Zip Mixtape.app for Appetize
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$DERIVED_DATA/Build/Products/Debug-iphonesimulator/Mixtape.app"
+          test -d "$APP"
+          file "$APP/Mixtape" | tee "$LOG_DIR/app-executable-architecture.txt"
+          lipo -archs "$APP/Mixtape" | tee -a "$LOG_DIR/app-executable-architecture.txt"
+          lipo "$APP/Mixtape" -verify_arch arm64
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" | tee "$LOG_DIR/minimum-ios.txt"
+          cd "$(dirname "$APP")"
+          ditto -c -k --sequesterRsrc --keepParent Mixtape.app "$GITHUB_WORKSPACE/Mixtape-Appetize.zip"
+          ls -lh "$GITHUB_WORKSPACE/Mixtape-Appetize.zip"
+          unzip -tq "$GITHUB_WORKSPACE/Mixtape-Appetize.zip"
+
+      - name: Upload Appetize ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mixtape-Appetize-Xcode26-2-ARMFix
+          path: Mixtape-Appetize.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save diagnostic logs even if build fails
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$LOG_DIR"
+          if [ -f "$LOG_DIR/xcodebuild.log" ]; then
+            grep -nE 'error:|fatal error:|CasePathsMacros|PerceptionMacros|must be enabled|CasePathableMacro|BUILD FAILED|No such module|framework not found|requires iOS|not available in iOS|DYLD_ROOT_PATH' "$LOG_DIR/xcodebuild.log" | tail -n 100 > "$LOG_DIR/error-summary.txt" || true
+          fi
+          if [ -d "$DERIVED_DATA/Build/Products" ]; then
+            find "$DERIVED_DATA/Build/Products" -maxdepth 6 -iname '*CasePaths*' -print > "$LOG_DIR/casepaths-products.txt" || true
+            while IFS= read -r path; do
+              if [ -f "$path" ]; then file "$path"; fi
+            done < "$LOG_DIR/casepaths-products.txt" > "$LOG_DIR/casepaths-binary-types.txt" || true
+          fi
+
+      - name: Record macro plugin executable architecture
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$LOG_DIR"
+          : > "$LOG_DIR/macro-executables.txt"
+          for root in "$DERIVED_DATA/Build/Products" "$DERIVED_DATA/Build/Intermediates.noindex"; do
+            if [ -d "$root" ]; then
+              find "$root" -type f \( -name 'CasePathsMacros' -o -name 'CasePathsMacros-tool' \
+                -o -name 'PerceptionMacros' -o -name 'PerceptionMacros-tool' \) -print 2>/dev/null | while IFS= read -r bin; do
+                  echo "== $bin" >> "$LOG_DIR/macro-executables.txt"
+                  file "$bin" >> "$LOG_DIR/macro-executables.txt" 2>&1
+                  otool -l "$bin" 2>/dev/null | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' | head -n 16 >> "$LOG_DIR/macro-executables.txt" || true
+                done
+            fi
+          done
+
+      - name: Inspect host macro build outputs on failure
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p "$LOG_DIR"
+          if [ -d "$DERIVED_DATA/Build/Intermediates.noindex" ]; then
+            find "$DERIVED_DATA/Build/Intermediates.noindex" -maxdepth 8 -iname '*CasePathsMacros*' -print > "$LOG_DIR/casepaths-intermediates.txt" || true
+          fi
+          xcrun swiftc -version > "$LOG_DIR/swift-version.txt" 2>&1 || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mixtape-Xcode26-2-ARMFix-diagnostics
+          path: build-xcode-26-2-clean/logs/
+          if-no-files-found: warn
+          retention-days: 7

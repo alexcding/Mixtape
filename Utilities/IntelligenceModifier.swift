@@ -12,7 +12,11 @@ struct RequiresIntelligenceModifier: ViewModifier {
     let unavailableMessage: String
 
     /// Access to the Foundation Models service.
+    #if IOS18_COMPAT
+    @State private var isAvailable = false
+#else
     @State private var isAvailable = FoundationModelsService.shared.isAvailable
+#endif
 
     func body(content: Content) -> some View {
         Group {
@@ -26,7 +30,11 @@ struct RequiresIntelligenceModifier: ViewModifier {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .intelligenceAvailabilityChanged)) { _ in
+            #if IOS18_COMPAT
+            self.isAvailable = false
+#else
             self.isAvailable = FoundationModelsService.shared.isAvailable
+#endif
         }
     }
 }

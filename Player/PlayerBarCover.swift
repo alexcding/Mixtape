@@ -194,6 +194,11 @@ struct PlayerBarCover: View {
             Spacer(minLength: 16)
 
             HStack(spacing: 10) {
+                if let track = viewModel.currentTrack {
+                    DownloadButton(song: track, style: .icon)
+                        .frame(width: 30, height: 30)
+                        .accessibilityLabel("Télécharger le morceau")
+                }
                 AirPlayButton()
                     .scaleEffect(1.2)
                     .frame(width: 30, height: 30)
@@ -205,52 +210,22 @@ struct PlayerBarCover: View {
 
     @ViewBuilder
     private func moreOptionsButton() -> some View {
-        Menu {
-            if let track = viewModel.currentTrack {
-                Button {
-                    viewModel.likeCurrentTrack()
-                } label: {
-                    Label(
-                        viewModel.currentTrackLikeStatus == .like ? "Liked" : "Like",
-                        systemImage: viewModel.currentTrackLikeStatus == .like ? "hand.thumbsup.fill" : "hand.thumbsup"
-                    )
+        if let song = viewModel.currentTrack {
+            MixtapeStableTrackActions(
+                song: song,
+                sourcePlaylist: viewModel.sourcePlaylist,
+                playerViewModel: viewModel,
+                onNavigate: {
+                    onDismiss()
+                    viewModel.onNavigateToPlaylist?()
                 }
-
-                Button {
-                    viewModel.dislikeCurrentTrack()
-                } label: {
-                    Label(
-                        viewModel.currentTrackLikeStatus == .dislike ? "Disliked" : "Dislike",
-                        systemImage: viewModel.currentTrackLikeStatus == .dislike ? "hand.thumbsdown.fill" : "hand.thumbsdown"
-                    )
-                }
-
-                Divider()
-
-                Button {
-                    viewModel.addToLibrary(track)
-                } label: {
-                    Label("Add to Library", systemImage: "plus.circle")
-                }
-
-                if let playlist = viewModel.sourcePlaylist {
-                    Divider()
-
-                    Button {
-                        onDismiss()
-                        viewModel.onNavigateToPlaylist?()
-                    } label: {
-                        Label("Go to \(playlist.title)", systemImage: "music.note.list")
-                    }
-                }
-            }
-        } label: {
+            )
+            .equatable()
+        } else {
             Image(systemName: "ellipsis.circle.fill")
                 .font(.system(size: 30, weight: .ultraLight))
-                .foregroundStyle(.white, .white.opacity(0.1))
+                .foregroundStyle(.secondary)
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
     }
 
     // MARK: - Progress Section
@@ -268,7 +243,6 @@ struct PlayerBarCover: View {
                 }
             }
             .tint(.primary)
-            .sliderThumbVisibility(.hidden)
 
             // Time labels
             HStack {
@@ -481,4 +455,62 @@ struct MPVolumeSlider: UIViewRepresentable {
     func updateUIView(_: MPVolumeView, context _: Context) {}
 }
 
+#endif
+
+#if os(iOS)
+/// The full-screen player updates its time every second. Keep the track menu
+/// outside that rendering dependency so an open menu is not rebuilt or closed.
+/// In particular, do not read player progress in this View's body.
+private struct MixtapeStableTrackActions: View, Equatable {
+    let song: Song
+    let sourcePlaylist: Playlist?
+    let playerViewModel: PlayerViewModel
+    let onNavigate: () -> Void
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.song.videoId == rhs.song.videoId &&
+        lhs.sourcePlaylist?.id == rhs.sourcePlaylist?.id
+    }
+
+    var body: some View {
+        Menu {
+            Button {
+                playerViewModel.likeCurrentTrack()
+            } label: {
+                Label("Aimer", systemImage: "hand.thumbsup")
+            }
+            Button {
+                playerViewModel.dislikeCurrentTrack()
+            } label: {
+                Label("Je n'aime pas", systemImage: "hand.thumbsdown")
+            }
+
+            Divider()
+
+            Button {
+                playerViewModel.addToLibrary(song)
+            } label: {
+                Label("Ajouter à la bibliothèque", systemImage: "plus.circle")
+            }
+
+            // Nested menus own their state separately from playback progress.
+            MixtapeQuickAddMenu(song: song)
+            DownloadContextMenuItems(song: song)
+
+            if let playlist = sourcePlaylist {
+                Divider()
+                Button(action: onNavigate) {
+                    Label("Aller à \(playlist.title)", systemImage: "music.note.list")
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle.fill")
+                .font(.system(size: 30, weight: .ultraLight))
+                .foregroundStyle(.white, .white.opacity(0.1))
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .accessibilityLabel("Options du morceau")
+    }
+}
 #endif

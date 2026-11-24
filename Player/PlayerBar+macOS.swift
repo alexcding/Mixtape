@@ -20,7 +20,7 @@ struct PlayerBar: View {
     @State private var isCenterHovered = false
 
     var body: some View {
-        GlassEffectContainer(spacing: 0) {
+        Group {
             HStack(spacing: 0) {
                 playbackControls()
                 Spacer()
@@ -131,7 +131,7 @@ struct PlayerBar: View {
                     }
                     .tint(.gray)
                     .controlSize(.mini)
-                    .sliderThumbVisibility(.hidden)
+
                     .frame(height: 2)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
                     .overlay(alignment: .top) {
@@ -334,7 +334,7 @@ struct PlayerBar: View {
             }
             .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .trailing)))
             .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 10))
-            .glassEffect()
+            .mixtapeCompatGlassEffect()
             .offset(x: 10)
             .onHover { hovering in
                 if !hovering {

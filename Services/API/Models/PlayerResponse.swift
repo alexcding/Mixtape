@@ -20,6 +20,25 @@ struct PlayerResponse: Codable, Sendable {
             .max { ($0.bitrate ?? 0) < ($1.bitrate ?? 0) }
     }
 
+    /// Shared policy for native streaming and offline files. Prefer AAC-LC,
+    /// while keeping valid HE-AAC available when a profile offers no LC audio.
+    func preferredNativeAudioFormat(quality: String) -> StreamingData.Format? {
+        let compatible = audioFormats.filter { $0.isAVPlayerCompatible && $0.isOriginal }
+        let lc = compatible.filter { $0.mimeType.contains("mp4a.40.2") }
+        let candidates = lc.isEmpty ? compatible : lc
+        switch quality {
+        case "economical":
+            return candidates.min { ($0.bitrate ?? Int.max) < ($1.bitrate ?? Int.max) }
+        case "maximum":
+            return candidates.max { ($0.bitrate ?? 0) < ($1.bitrate ?? 0) }
+        default:
+            if let standard = candidates.first(where: { $0.itag == 140 }) { return standard }
+            return candidates.min {
+                abs(($0.bitrate ?? 128_000) - 128_000) < abs(($1.bitrate ?? 128_000) - 128_000)
+            }
+        }
+    }
+
     /// Gets all available audio formats sorted by quality (highest first).
     var audioFormats: [StreamingData.Format] {
         streamingData?.adaptiveFormats

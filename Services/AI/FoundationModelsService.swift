@@ -10,6 +10,7 @@ import os
 /// Session types help organize the code and provide semantic meaning,
 /// but note that Apple's Foundation Models framework does not expose
 /// temperature control in macOS 26. All sessions use the system default.
+@available(iOS 26.0, *)
 enum AISessionType: String, CaseIterable, Sendable {
     /// Quick command parsing (play, skip, queue, etc.)
     /// Best for predictable structured output.
@@ -72,6 +73,7 @@ enum AISessionType: String, CaseIterable, Sendable {
 /// `prewarm()` API to load model resources without sending dummy prompts.
 @MainActor
 @Observable
+@available(iOS 26.0, *)
 final class FoundationModelsService {
     // MARK: - Singleton
 

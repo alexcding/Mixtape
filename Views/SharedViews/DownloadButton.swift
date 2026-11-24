@@ -159,6 +159,11 @@ struct DownloadContextMenuItems: View {
                 Label("Cancel Download", systemImage: "xmark.circle")
             }
         case .completed:
+            Button {
+                Task { await downloadManager.repairExistingDownloadIfNeeded(videoId: song.videoId, force: true) }
+            } label: {
+                Label("Vérifier la durée du fichier", systemImage: "waveform.path")
+            }
             Button(role: .destructive) {
                 downloadManager.deleteDownload(videoId: song.videoId)
             } label: {

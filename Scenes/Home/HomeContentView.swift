@@ -33,6 +33,7 @@ struct HomeContentView: View {
             .padding(.vertical, 24)
             .scrollClipDisabled()
         }
+        .mixtapeScrollAbovePlayer()
         .onScrollTargetVisibilityChange(idType: HomeSection.ID.self, threshold: 0.2) { visibleIDs in
             self.viewModel.loadMoreIfNeeded(visibleSectionIDs: Set(visibleIDs))
         }

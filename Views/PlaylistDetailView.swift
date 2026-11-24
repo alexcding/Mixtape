@@ -91,6 +91,7 @@ struct PlaylistDetailView: View {
             .listRowBackground(Color.clear)
         }
         .listStyle(.plain)
+        .mixtapeScrollAbovePlayer()
         .contextMenu(forSelectionType: Song.self, menu: { selectedTracks in
             if let track = selectedTracks.first {
                 Button {
@@ -126,6 +127,7 @@ struct PlaylistDetailView: View {
                 Divider()
 
                 DownloadContextMenuItems(song: track)
+                MixtapeQuickAddMenu(song: track)
 
                 Divider()
 

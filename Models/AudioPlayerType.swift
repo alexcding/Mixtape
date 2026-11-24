@@ -30,10 +30,10 @@ enum AudioPlayerType: String, CaseIterable, Identifiable, Sendable {
     }
 
     /// Available player types for the current platform.
-    /// iOS does not support WebView player.
+    /// iOS 18 fallback: Web Player uses the interactive YouTube Music site.
     static var availableCases: [AudioPlayerType] {
         #if os(iOS)
-        [.native, .vlc]
+        [.native, .vlc, .webView]
         #else
         allCases
         #endif

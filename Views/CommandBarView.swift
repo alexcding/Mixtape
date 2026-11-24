@@ -1,4 +1,6 @@
+#if !IOS18_COMPAT
 import FoundationModels
+#endif
 import SwiftUI
 import FactoryKit
 import os
@@ -184,6 +186,7 @@ struct CommandBarView: View {
         }
     }
 
+#if !IOS18_COMPAT
     /// System instructions for the AI session.
     private var aiSystemInstructions: String {
         """
@@ -284,6 +287,19 @@ struct CommandBarView: View {
         self.isProcessing = false
     }
 
+#else
+    // iOS 18: use Mixtape's existing ordinary YouTube Music search instead
+    // of FoundationModels' natural-language interpretation.
+    private func processCommand() async {
+        let query = self.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        self.isProcessing = true
+        self.errorMessage = nil
+        self.resultMessage = nil
+        await self.fallbackDirectSearch(query: query)
+        self.isProcessing = false
+    }
+#endif
     /// Fallback to direct search when AI parsing fails.
     private func fallbackDirectSearch(query: String) async {
         // Extract action keyword and clean query
@@ -342,6 +358,7 @@ struct CommandBarView: View {
         }
     }
 
+#if !IOS18_COMPAT
     private func executeIntent(_ intent: MusicIntent) async {
         // Build the search query from parsed components
         let searchQuery = intent.buildSearchQuery()
@@ -418,6 +435,7 @@ struct CommandBarView: View {
         }
     }
 
+#endif
     private func playSearchResult(query: String, description: String = "") async {
         do {
             // Use songs-only filtered search to exclude podcasts/videos
@@ -484,6 +502,7 @@ struct CommandBarView: View {
         self.dismissCommandBar()
     }
 
+#if !IOS18_COMPAT
     // MARK: - Content Routing
 
     /// Plays content from the best source based on the intent.
@@ -670,7 +689,8 @@ struct CommandBarView: View {
     private func matchesSearchTerms(_ title: String, _ terms: [String]) -> Bool {
         let titleLower = title.lowercased()
         return terms.contains { titleLower.contains($0) }
-    }
+    }#endif
+
 }
 
 // MARK: - SuggestionChip

@@ -21,6 +21,7 @@ struct DiscoveryContentView: View {
             .padding(.vertical, 24)
             .scrollClipDisabled()
         }
+        .mixtapeScrollAbovePlayer()
         .loading(viewModel.loadingState) {
             await viewModel.load()
         }

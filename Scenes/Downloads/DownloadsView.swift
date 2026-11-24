@@ -79,6 +79,7 @@ struct DownloadsView: View {
             }
         }
         .listStyle(.plain)
+        .mixtapeScrollAbovePlayer()
     }
 
     // MARK: - Active Downloads
@@ -385,7 +386,15 @@ struct DownloadsView: View {
                 Label("Play", systemImage: "play.fill")
             }
 
+            Button {
+                viewModel.repairDownload(download)
+            } label: {
+                Label("Vérifier / raccourcir le silence", systemImage: "waveform.path")
+            }
+
             Divider()
+
+            MixtapeQuickAddMenu(song: download.song)
 
             Button(role: .destructive) {
                 viewModel.deleteDownload(download)

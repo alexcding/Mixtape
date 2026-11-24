@@ -59,21 +59,57 @@ struct AppCoordinatorView: View {
     @ViewBuilder
     private func miniPlayerOverlay(videoId: String) -> some View {
         let showMiniPlayer = playerManager.showMiniPlayer
-
+        #if os(iOS)
+        ZStack {
+            if showMiniPlayer {
+                Color.black.opacity(0.58).ignoresSafeArea()
+            }
+            VStack(spacing: 0) {
+                if showMiniPlayer {
+                    HStack {
+                        Text("YouTube Music – Web Player")
+                            .font(.headline)
+                        Spacer()
+                        Button("Réduire") { playerManager.miniPlayerDismissed() }
+                            .buttonStyle(.bordered)
+                    }
+                    .padding(12)
+                    Text("Appuyez sur Lecture dans la page pour autoriser l'audio sur iOS.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                }
+                PersistentPlayerView(
+                    videoId: videoId,
+                    isExpanded: showMiniPlayer,
+                    playerManager: coordinator.playerManager,
+                    webKitManager: coordinator.webKitManager
+                )
+                .frame(width: showMiniPlayer ? nil : 8, height: showMiniPlayer ? 540 : 8)
+                .opacity(showMiniPlayer ? 1 : 0.001)
+                .allowsHitTesting(showMiniPlayer)
+            }
+            .frame(maxWidth: showMiniPlayer ? .infinity : 8)
+            .background(showMiniPlayer ? Color(uiColor: .systemBackground) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .padding(showMiniPlayer ? 12 : 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(showMiniPlayer)
+        #else
         PersistentPlayerView(
             videoId: videoId,
             isExpanded: showMiniPlayer,
             playerManager: coordinator.playerManager,
             webKitManager: coordinator.webKitManager
         )
-            .frame(
-                width: 0.01,
-                height: 0.01
-            )
+            .frame(width: 0.01, height: 0.01)
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .opacity(showMiniPlayer ? 0.95 : 0)
             .allowsHitTesting(showMiniPlayer)
             .opacity(0.001)
+        #endif
     }
 
     // MARK: - Command Bar Overlay
@@ -258,7 +294,7 @@ struct AppCoordinatorView: View {
             }
             .accessibilityIdentifier(AccessibilityID.Sidebar.exploreItem)
 
-            Tab("Library", systemImage: "music.note.square.stack.fill", value: NavigationItem.library) {
+            Tab("Bibliothèque", systemImage: "square.stack.fill", value: NavigationItem.library) {
                 LazyView {
                     LibraryCoordinatorView(coordinator: coordinator.libraryCoordinator)
                 }
@@ -275,13 +311,21 @@ struct AppCoordinatorView: View {
             .accessibilityIdentifier(AccessibilityID.Sidebar.searchItem)
         }
         .environment(playerBarAppearance)
+        .environment(\.mixtapeMiniPlayerVisible, playerManager.currentTrack != nil)
         .tabViewStyle(.sidebarAdaptable)
-        .tabViewBottomAccessory {
-            PlayerBar(viewModel: coordinator.playerViewModel, actualColorScheme: colorScheme, showFullscreenPlayer: $showFullscreenPlayer)
+        .mixtapeCompatTabViewBottomAccessory {
+            if playerManager.currentTrack != nil {
+                PlayerBar(
+                    viewModel: coordinator.playerViewModel,
+                    actualColorScheme: colorScheme,
+                    showFullscreenPlayer: $showFullscreenPlayer
+                )
+                .environment(playerBarAppearance)
                 .matchedTransitionSource(id: "player", in: playerNamespace)
                 .bottomAccessorySizeConstrained()
+            }
         }
-        .tabBarMinimizeBehavior(.onScrollDown)
+        .mixtapeCompatTabBarMinimizeOnScrollDown()
         .fullScreenCover(isPresented: $showFullscreenPlayer) {
             ScrollView {
 

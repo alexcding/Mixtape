@@ -1,0 +1,144 @@
+name: Mixtape - iOS 18 Native Audio v39
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/ios18-native-v39]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    timeout-minutes: 120
+    env:
+      BUILD_ROOT: ${{ github.workspace }}/build-ios18-v39
+      DERIVED_DATA: ${{ github.workspace }}/build-ios18-v39/DerivedData
+      SPM_SOURCES: ${{ github.workspace }}/build-ios18-v39/SourcePackages
+      LOG_DIR: ${{ github.workspace }}/build-ios18-v39/logs
+      IPA_NAME: Mixtape-iOS18-Native-v39-unsigned.ipa
+
+    steps:
+      - name: Check out persisted iOS 18 sources
+        uses: actions/checkout@v4
+
+      - name: Prepare Xcode 26.2 and build logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DERIVED_DATA" "$SPM_SOURCES" "$LOG_DIR"
+          XCODE_APP=/Applications/Xcode_26.2.app
+          test -d "$XCODE_APP"
+          sudo xcode-select --switch "$XCODE_APP/Contents/Developer"
+          xcodebuild -version | tee "$LOG_DIR/xcode-version.txt"
+          grep -Fxq 'Xcode 26.2' "$LOG_DIR/xcode-version.txt"
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          xcodebuild -showsdks > "$LOG_DIR/sdks.txt"
+          git rev-parse HEAD > "$LOG_DIR/source-commit.txt"
+
+      - name: Validate persisted source prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_ios18_sources.py --report "$LOG_DIR/source-validation.json"
+
+      - name: Test native HTTP audio transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path "$GITHUB_WORKSPACE" 2>&1 | tee "$LOG_DIR/transport-tests.log"
+
+      - name: Install VLCKit XCFrameworks
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v carthage >/dev/null 2>&1; then brew install carthage; fi
+          carthage bootstrap --use-xcframeworks --platform iOS --cache-builds 2>&1 | tee "$LOG_DIR/carthage.log"
+          test -d Carthage/Build/MobileVLCKit.xcframework
+
+      - name: Resolve app packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project Mixtape.xcodeproj -scheme Mixtape \
+            -clonedSourcePackagesDirPath "$SPM_SOURCES" \
+            2>&1 | tee "$LOG_DIR/spm.log"
+          RESOLVED=Mixtape.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          if [ -f "$RESOLVED" ]; then cp "$RESOLVED" "$LOG_DIR/Package.resolved"; fi
+
+      - name: Validate effective iPhone build settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project Mixtape.xcodeproj -scheme Mixtape \
+            -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
+            -clonedSourcePackagesDirPath "$SPM_SOURCES" -skipMacroValidation \
+            -showBuildSettings -json > "$LOG_DIR/build-settings.json" 2> "$LOG_DIR/build-settings.log"
+          python3 scripts/validate_ios18_sources.py \
+            --build-settings "$LOG_DIR/build-settings.json" \
+            --report "$LOG_DIR/effective-settings-validation.json"
+
+      - name: Build unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project Mixtape.xcodeproj -scheme Mixtape \
+            -configuration Debug -destination 'generic/platform=iOS' -sdk iphoneos \
+            -derivedDataPath "$DERIVED_DATA" \
+            -clonedSourcePackagesDirPath "$SPM_SOURCES" \
+            -jobs 2 -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION=1.0.39 CURRENT_PROJECT_VERSION=39 \
+            build 2>&1 | tee "$LOG_DIR/xcodebuild.log"
+
+      - name: Validate app and embedded iOS minimum versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$DERIVED_DATA/Build/Products/Debug-iphoneos/Mixtape.app"
+          test -d "$APP"
+          lipo "$APP/Mixtape" -verify_arch arm64
+          python3 scripts/validate_ios18_binary.py "$APP" --report "$LOG_DIR/embedded-minimum-versions.json"
+          xcrun dwarfdump --uuid "$APP/Mixtape" > "$LOG_DIR/app-binary-uuid.txt"
+          find "$APP" -name 'Mixtape.debug.dylib' -exec xcrun dwarfdump --uuid '{}' \; > "$LOG_DIR/debug-dylib-uuid.txt"
+
+      - name: Package unsigned IPA for sideloading
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$DERIVED_DATA/Build/Products/Debug-iphoneos/Mixtape.app"
+          mkdir -p "$BUILD_ROOT/package/Payload"
+          ditto "$APP" "$BUILD_ROOT/package/Payload/Mixtape.app"
+          cd "$BUILD_ROOT/package"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/$IPA_NAME"
+          unzip -tq "$GITHUB_WORKSPACE/$IPA_NAME"
+          shasum -a 256 "$GITHUB_WORKSPACE/$IPA_NAME" > "$LOG_DIR/ipa-sha256.txt"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mixtape-iOS18-Native-v39-unsigned-IPA
+          path: Mixtape-iOS18-Native-v39-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Gather build diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$LOG_DIR"
+          if [ -f "$LOG_DIR/xcodebuild.log" ]; then
+            grep -nE 'error:|fatal error:|unavailable in iOS|only available in iOS|requires iOS|BUILD FAILED|No such module|cannot find|undefined symbol|deployment target|linker command failed' \
+              "$LOG_DIR/xcodebuild.log" | tail -n 140 > "$LOG_DIR/build-errors.txt" || true
+          fi
+          git diff --stat > "$LOG_DIR/source-diff-stat.txt"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mixtape-iOS18-Native-v39-diagnostics
+          path: build-ios18-v39/logs/
+          if-no-files-found: warn
+          retention-days: 14

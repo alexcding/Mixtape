@@ -136,6 +136,13 @@ final class DownloadsViewModel: HashableObject {
 
     // MARK: - Delete Actions
 
+    /// Check and repair long silent tails in an already downloaded track.
+    func repairDownload(_ download: DownloadedSong) {
+        Task {
+            await downloadManager.repairExistingDownloadIfNeeded(videoId: download.id, force: true)
+        }
+    }
+
     /// Deletes a downloaded song.
     func deleteDownload(_ download: DownloadedSong) {
         downloadManager.deleteDownload(videoId: download.id)

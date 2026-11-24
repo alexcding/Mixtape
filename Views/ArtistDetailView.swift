@@ -166,6 +166,7 @@ struct ArtistDetailView: View {
                         .background(Color(.systemBackground))
                     }
                 }
+                .mixtapeScrollAbovePlayer()
                 .onScrollGeometryChange(for: CGFloat.self) { geo in
                     geo.contentOffset.y + geo.contentInsets.top
                 } action: { _, newValue in

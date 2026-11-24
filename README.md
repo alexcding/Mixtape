@@ -1,5 +1,55 @@
 # Mixtape
 
+This fork now contains the iOS 18 port directly in source. The active build is
+**iOS 18 Native Audio v39**. The historical patch-generating workflows are kept
+in `Tools/LegacyWorkflows/` for reference; they expect the original upstream
+source and must not be reapplied to this tree.
+
+The native player is preferred on both Wi-Fi and cellular. Settings retain an
+explicit Web mode and an optional Web fallback for the same track. Native audio
+uses a retained `AVAssetResourceLoaderDelegate` and bounded HTTP ranges through
+URLSession, preserving the stream profile's HTTP identity. Playback can begin
+without first downloading an entire song. Track changes, pause, seek and stop
+invalidate obsolete asynchronous work.
+
+Offline downloads use validated HTTP ranges, discover missing file sizes from
+the server and refresh a rejected stream profile once. A download is published
+only after AVFoundation can decode samples at its beginning, middle and end.
+Catalogue writes are ordered, cancelled requests cannot revive, and interrupted
+queue entries restart when the app next launches. iOS grants only finite
+background execution for these foreground transfers; keeping a large download
+running indefinitely after leaving or terminating the app is not guaranteed.
+Silence is preserved. Tail repair is an explicit manual action.
+
+Build an unsigned IPA from the GitHub Actions workflow
+`.github/workflows/build-ios18-native-v39.yml`, or open `Mixtape.xcodeproj` with
+Xcode 26.2 on macOS. The app deployment target is iOS 18.0. The workflow runs
+Foundation transport tests, installs VLCKit, builds the app, checks embedded
+minimum OS versions and uploads the IPA plus diagnostics. Signing/sideloading
+still uses your existing iOS installation method.
+
+Validation commands on macOS:
+
+```sh
+python3 scripts/validate_ios18_sources.py
+swift test
+```
+
+Transport fixtures test successful/clipped ranges, HTTP failures, incomplete
+bodies and cancellation. These tests do not prove audible playback on an
+iPhone. Before treating the build as validated, test a complete online track,
+seek past the first minute, change tracks rapidly, pause during loading, then
+download a track and play it with airplane mode enabled. Check background audio
+and lock-screen play/pause, seek and next/previous on an iOS 18 device. A moving
+timer alone is insufficient evidence of decoded sound.
+
+Stream profiles were checked against
+[yt-dlp's client definitions](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/youtube/_base.py)
+on 2026-11-24. A no-cookie control request using `IOS_PRODUCER` returned a direct
+AAC itag 140 URL and 1024 valid MP4 bytes (HTTP 206) from this workstation.
+That narrow live check does not validate an entire download or AVPlayer on iOS;
+availability can differ by track, region, account and network.
+
 A native YouTube Music client for macOS and iOS, built with SwiftUI and the Liquid Glass design language.
 
 > Mixtape uses YouTube Music's unofficial web API. It is not affiliated with, endorsed by, or sponsored by Google or YouTube.

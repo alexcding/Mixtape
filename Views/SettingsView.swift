@@ -13,6 +13,12 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var viewModel: SettingsViewModel
+    @AppStorage("mixtape.ios18.downloadQuality") private var downloadQuality = "balanced"
+    @AppStorage("mixtape.ios18.streamingMode") private var streamingMode = "audio"
+    @AppStorage("mixtape.ios18.streamingQuality") private var streamingQuality = "balanced"
+    @AppStorage("mixtape.ios18.allowWebFallback") private var allowWebFallback = true
+    @AppStorage("mixtape.ios18.lastNativeFallback") private var lastNativeFallback = ""
+    @AppStorage("mixtape.ios18.v35.nativeTrace") private var nativeTraceV35 = ""
 
     var body: some View {
         NavigationStack {
@@ -67,27 +73,73 @@ struct SettingsView: View {
                 }
                 
                 // MARK: - Playback Section
-
                 Section {
-                    Picker("Audio Player", selection: Binding(
-                        get: { viewModel.currentPlayerType },
-                        set: { newValue in
-                            Task {
-                                await viewModel.switchPlayer(to: newValue)
-                            }
-                        }
-                    )) {
-                        ForEach(AudioPlayerType.availableCases) { player in
-                            Text(player.localizedName).tag(player)
-                        }
+                    Picker("Mode de lecture", selection: $streamingMode) {
+                        Text("Lecteur natif").tag("audio")
+                        Text("Compatibilité Web").tag("web")
                     }
-                    .disabled(viewModel.isSwitchingPlayer)
+                    Picker("Qualité audio en streaming", selection: $streamingQuality) {
+                        Text("Économie (AAC-LC compatible)").tag("economical")
+                        Text("Équilibrée (AAC-LC 128 kb/s si disponible)").tag("balanced")
+                        Text("Qualité maximale disponible").tag("maximum")
+                    }
+                    .disabled(streamingMode == "web")
+                Toggle("Autoriser le lecteur Web de secours", isOn: $allowWebFallback)
+                    .disabled(streamingMode == "web")
                 } header: {
-                    Text("Playback")
+                    Text("Lecture en ligne")
                 } footer: {
-                    Text(viewModel.playbackFooterText)
+                    Text("Le lecteur natif est utilisé sur Wi-Fi et sur réseau mobile. Le secours Web peut prendre le relais sur le même morceau en cas d’échec. S’applique au prochain titre. Les téléchargements sont lus localement.")
                 }
-                
+
+                // MARK: - Offline download quality
+                Section {
+                    Picker("Qualité du téléchargement", selection: $downloadQuality) {
+                        Text("Économie (petit fichier)").tag("economical")
+                        Text("Équilibrée (environ 128 kb/s)").tag("balanced")
+                        Text("Maximum disponible").tag("maximum")
+                    }
+                } header: {
+                    Text("Téléchargements")
+                } footer: {
+                    Text("La qualité réelle dépend des formats AAC disponibles. Ce choix s'applique aux prochains téléchargements, pas aux fichiers déjà enregistrés.")
+                }
+
+                // MARK: - Native audio events (v35)
+                if !nativeTraceV35.isEmpty {
+                    Section {
+                        Text(nativeTraceV35)
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                        ShareLink(item: nativeTraceV35) {
+                            Label("Partager le journal audio natif", systemImage: "square.and.arrow.up")
+                        }
+                        Button("Effacer le journal audio", role: .destructive) {
+                            nativeTraceV35 = ""
+                        }
+                    } header: {
+                        Text("Journal audio")
+                    } footer: {
+                        Text("Heures UTC, profils et statuts réseau, étapes AVPlayer. Aucun cookie ni lien signé n'est enregistré.")
+                    }
+                }
+
+                // MARK: - Audio diagnostics (iOS 18 compatibility)
+                if !lastNativeFallback.isEmpty {
+                    Section {
+                        Text(lastNativeFallback)
+                            .font(.footnote)
+                            .textSelection(.enabled)
+                        ShareLink(item: lastNativeFallback) {
+                            Label("Partager le diagnostic", systemImage: "square.and.arrow.up")
+                        }
+                    } header: {
+                        Text("Dernier échec du lecteur audio seul")
+                    } footer: {
+                        Text("Une erreur HTTP 403 signifie que le serveur refuse le flux direct. Un délai dépassé peut indiquer un réseau lent ou un chargement bloqué.")
+                    }
+                }
+
                 // MARK: - About Section
                 
                 Section {
@@ -139,6 +191,9 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $viewModel.showLoginSheet) {
             LoginSheet()
+        }
+        .onAppear {
+            if streamingMode == "auto" { streamingMode = "audio" }
         }
     }
 }

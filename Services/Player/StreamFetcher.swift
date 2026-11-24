@@ -39,6 +39,7 @@ struct StreamClient: Sendable {
         var client: [String: Any] = [
             "clientName": name,
             "clientVersion": version,
+            "userAgent": userAgent,
             "hl": Locale.current.language.languageCode?.identifier ?? "en",
             "gl": Locale.current.region?.identifier ?? "US",
         ]
@@ -47,7 +48,7 @@ struct StreamClient: Sendable {
         if let osVersion { client["osVersion"] = osVersion }
         if let deviceMake { client["deviceMake"] = deviceMake }
         if let deviceModel { client["deviceModel"] = deviceModel }
-        if let androidSdkVersion { client["androidSdkVersion"] = androidSdkVersion }
+        if let androidSdkVersion, let sdk = Int(androidSdkVersion) { client["androidSdkVersion"] = sdk }
         if let visitorData { client["visitorData"] = visitorData }
 
         return [
@@ -56,7 +57,7 @@ struct StreamClient: Sendable {
         ]
     }
 
-    /// ANDROID_VR client - most reliable for direct stream URLs.
+    /// Legacy profile, retained for diagnostics; excluded from default resolution.
     static let androidVR = StreamClient(
         name: "ANDROID_VR",
         version: "1.61.48",
@@ -85,10 +86,10 @@ struct StreamClient: Sendable {
     /// iOS client as fallback.
     static let ios = StreamClient(
         name: "IOS",
-        version: "20.10.4",
+        version: "21.26.4",
         clientId: "5",
-        userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-        osName: "iOS",
+        userAgent: "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        osName: "iPhone",
         osVersion: "18.3.2.22D82",
         deviceMake: "Apple",
         deviceModel: "iPhone16,2",
@@ -108,8 +109,24 @@ struct StreamClient: Sendable {
         androidSdkVersion: nil
     )
 
-    /// Clients to try in order.
-    static let fallbackClients: [StreamClient] = [.androidVR, .androidMusic, .ios, .tvhtml5]
+    // Profiles verified against yt-dlp's client definitions on 2026-11-24.
+    // A player response still needs a real CDN check on the listener's network.
+    static let visionOS = StreamClient(
+        name: "VISIONOS", version: "1.02", clientId: "101",
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        osName: "visionOS", osVersion: "26.5.23O471",
+        deviceMake: "Apple", deviceModel: "RealityDevice17,1", androidSdkVersion: nil
+    )
+
+    static let iosProducer = StreamClient(
+        name: "IOS_PRODUCER", version: "0.147.945", clientId: "92",
+        userAgent: "com.google.ios.youtubeproducer/0.147.945 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        osName: "iPhone", osVersion: "18.3.2.22D82",
+        deviceMake: "Apple", deviceModel: "iPhone16,2", androidSdkVersion: nil
+    )
+
+    /// Keep API and CDN identities paired; never reuse a rejected profile's URL.
+    static let fallbackClients: [StreamClient] = [.iosProducer, .visionOS, .ios, .androidMusic]
 }
 
 /// Result of a successful stream fetch.
@@ -145,25 +162,30 @@ final class StreamFetcher {
     /// - Returns: StreamFetchResult with URL and metadata, or nil if all clients failed
     func fetchStream(
         videoId: String,
+        excludingClients: Set<String> = [],
         formatSelector: (PlayerResponse) -> PlayerResponse.StreamingData.Format?
     ) async -> Result<StreamFetchResult, Error> {
         await BackgroundTaskHelper.withBackgroundTask {
-            await self.performFetchStream(videoId: videoId, formatSelector: formatSelector)
+            await self.performFetchStream(videoId: videoId, excludingClients: excludingClients, formatSelector: formatSelector)
         }
     }
 
     private func performFetchStream(
         videoId: String,
+        excludingClients: Set<String>,
         formatSelector: (PlayerResponse) -> PlayerResponse.StreamingData.Format?
     ) async -> Result<StreamFetchResult, Error> {
         let visitorData = await fetchVisitorData()
         logger.info("[StreamFetcher] Using visitor data: \(visitorData != nil)")
 
         var lastError: Error?
+        var attemptFailures: [String] = []
 
-        for (index, client) in StreamClient.fallbackClients.enumerated() {
+        for (index, client) in StreamClient.fallbackClients.enumerated() where !excludingClients.contains(client.name) {
             do {
+                try Task.checkCancellation()
                 logger.info("[StreamFetcher] Trying client \(index + 1)/\(StreamClient.fallbackClients.count): \(client.name)")
+                MixtapeNativeAudioTrace.add("trying client \(client.name)")
 
                 let playerResponse = try await fetchPlayerResponse(
                     videoId: videoId,
@@ -178,13 +200,29 @@ final class StreamFetcher {
                       let urlString = format.url,
                       let streamURL = URL(string: urlString)
                 else {
-                    logger.warning("[StreamFetcher] No suitable format found, trying next client...")
+                    let diagnosis = "\(client.name): no directly usable audio format (playability=\(playerResponse.playabilityStatus.status), audio URLs=\(playerResponse.audioFormats.count))"
+                    attemptFailures.append(diagnosis)
+                    logger.warning("[StreamFetcher] No suitable format: \(diagnosis)")
+                    MixtapeNativeAudioTrace.add("client \(client.name): no AAC URL")
                     continue
                 }
 
                 let bitrateK = (format.bitrate ?? 0) / 1000
                 let codec = Self.parseCodec(from: format.mimeType)
                 logger.info("[StreamFetcher] Selected: itag=\(format.itag), \(codec) \(bitrateK)kbps")
+
+                // Verify CDN access before committing to this stream profile.
+                // This runs on the iPhone, not on the GitHub Actions runner.
+                let cdnStatus = try await probeAudioCDN(streamURL, client: client)
+                guard (200 ..< 300).contains(cdnStatus) else {
+                    let diagnosis = "\(client.name): audio CDN HTTP \(cdnStatus) (player API returned a URL but the CDN rejected it)"
+                    attemptFailures.append(diagnosis)
+                                    logger.warning("[StreamFetcher] \(diagnosis)")
+                MixtapeNativeAudioTrace.add("CDN \(client.name) HTTP \(cdnStatus)")
+                    continue
+                }
+                                logger.info("[StreamFetcher] \(client.name): CDN probe HTTP \(cdnStatus), starting player")
+                MixtapeNativeAudioTrace.add("CDN \(client.name) HTTP \(cdnStatus)")
 
                 // Get duration from API
                 let apiDuration: TimeInterval?
@@ -205,12 +243,20 @@ final class StreamFetcher {
                 ))
 
             } catch {
-                logger.warning("[StreamFetcher] Client \(client.name) failed: \(error.localizedDescription)")
+                if Task.isCancelled || error is CancellationError {
+                    return .failure(CancellationError())
+                }
+                let nsError = error as NSError
+                let diagnosis = "\(client.name): \(error.localizedDescription) [\(nsError.domain):\(nsError.code)]"
+                attemptFailures.append(String(diagnosis.prefix(220)))
+                logger.warning("[StreamFetcher] Client failed: \(diagnosis)")
+                MixtapeNativeAudioTrace.add("API client \(client.name) failed \(nsError.domain):\(nsError.code)")
                 lastError = error
             }
         }
 
-        return .failure(lastError ?? YTMusicError.apiError(message: "All clients failed", code: nil))
+        let details = attemptFailures.isEmpty ? (lastError?.localizedDescription ?? "No direct audio URL") : attemptFailures.joined(separator: " | ")
+        return .failure(YTMusicError.playbackError(message: "All stream profiles failed: \(details)"))
     }
 
     /// Creates AudioFormatInfo from a format and available formats count.
@@ -283,15 +329,22 @@ final class StreamFetcher {
         return .failure(lastError ?? YTMusicError.apiError(message: "No HLS manifest available", code: nil))
     }
 
+    /// Use the same bounded probe and request identity as the transfer path.
+    private func probeAudioCDN(_ url: URL, client: StreamClient) async throws -> Int {
+        try await MixtapeHTTPAudioTransfer.probe(url: url, userAgent: client.userAgent)
+    }
+
     // MARK: - Private Methods
 
     /// Fetches visitor data from YouTube for bot detection avoidance.
     private func fetchVisitorData() async -> String? {
         if let cached = visitorData {
+            MixtapeNativeAudioTrace.add("visitor data cache reused")
             return cached
         }
 
         logger.info("[StreamFetcher] Fetching visitor data from YouTube")
+        MixtapeNativeAudioTrace.add("visitor data fetch started")
 
         guard let url = URL(string: "https://music.youtube.com/sw.js_data") else {
             return nil
@@ -321,7 +374,7 @@ final class StreamFetcher {
                 let visitorData = findVisitorData(in: json)
                 if let visitorData {
                     self.visitorData = visitorData
-                    logger.info("[StreamFetcher] Got visitor data: \(visitorData.prefix(20))...")
+                    logger.info("[StreamFetcher] Visitor data received")
                 }
                 return visitorData
             }
@@ -393,6 +446,7 @@ final class StreamFetcher {
             throw YTMusicError.apiError(message: "HTTP \(httpResponse.statusCode)", code: httpResponse.statusCode)
         }
 
+        MixtapeNativeAudioTrace.add("API \(client.name) HTTP \(httpResponse.statusCode)")
         let playerResponse = try JSONDecoder().decode(PlayerResponse.self, from: data)
 
         guard playerResponse.isPlayable else {

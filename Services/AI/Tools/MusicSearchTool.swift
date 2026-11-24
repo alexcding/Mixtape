@@ -5,6 +5,7 @@ import os
 /// A tool that allows the language model to search the YouTube Music catalog.
 /// This grounds AI responses in real music data rather than hallucinated song IDs.
 @MainActor
+@available(iOS 26.0, *)
 struct MusicSearchTool: Tool {
     /// The YTMusicClient used for API calls.
     private let client: any YTMusicClientProtocol

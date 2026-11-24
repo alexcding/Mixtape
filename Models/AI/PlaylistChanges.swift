@@ -1,3 +1,13 @@
+// iOS 18: keep plain playlist-change metadata for view model state, without
+// importing FoundationModels or generating iOS 26-only macros.
+#if IOS18_COMPAT
+import Foundation
+struct PlaylistChanges: Sendable {
+    let removals: [String]
+    let reorderedIds: [String]?
+    let reasoning: String
+}
+#else
 import Foundation
 import FoundationModels
 
@@ -18,3 +28,4 @@ struct PlaylistChanges: Sendable {
     @Guide(description: "A brief, friendly explanation of the suggested changes (1-2 sentences).")
     let reasoning: String
 }
+#endif

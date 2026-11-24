@@ -1,18 +1,11 @@
 import AVFoundation
 import Foundation
-import MediaPlayer
-import Network
 import os
-#if os(iOS)
-import UIKit
-#endif
 
-/// Native audio player using AVPlayer for direct stream playback.
-/// Replaces WebView-based playback with native InnerTube API streams.
+/// Native AAC playback. PlayerManager owns the queue and audio session;
+/// NowPlayingManager owns remote commands for every playback engine.
 @MainActor
 final class YTMusicNativePlayer: YTMusicPlayer {
-    // MARK: - YTMusicPlayer Callbacks
-
     var onPlaybackUpdate: ((_ isPlaying: Bool, _ currentTime: TimeInterval, _ duration: TimeInterval) -> Void)?
     var onTrackEnded: (() -> Void)?
     var onTrackMetadataChanged: ((_ title: String, _ artist: String, _ thumbnailUrl: String) -> Void)?
@@ -21,300 +14,260 @@ final class YTMusicNativePlayer: YTMusicPlayer {
     var onAudioQualityChanged: ((_ bitrateKbps: Int, _ codec: String) -> Void)?
     var onStateChange: ((_ state: PlayerManager.PlaybackState) -> Void)?
 
-    // MARK: - Properties
-
-    /// Current playback session (encapsulates AVPlayer and observers).
-    private var session: NativePlayerSession?
-
-    private let logger = DiagnosticsLogger.player
-
-    /// Stream fetcher for YouTube API interaction.
     private let streamFetcher = StreamFetcher()
-
-    /// The current video ID being played.
-    private(set) var currentVideoId: String?
-
-    /// The current stream URL (expires after ~6 hours).
-    private var currentStreamURL: URL?
-
-    /// When the stream URL was fetched (for expiration tracking).
-    private var streamFetchTime: Date?
-
-    /// Current audio format info (bitrate, codec, etc.).
-    private(set) var currentAudioFormat: AudioFormatInfo?
-
-    /// Stream expiration time in seconds (default 6 hours, but we refresh early).
-    private let streamExpirationBuffer: TimeInterval = 5 * 60 * 60 // Refresh after 5 hours
-
-    /// Network path monitor for detecting cellular vs WiFi.
-    private let networkMonitor = NWPathMonitor()
-
-    /// Whether currently on cellular network.
-    private var isOnCellular: Bool = false
-
-    /// Current volume level.
-    private(set) var volume: Float = 1.0
-
-    /// The client that was used to fetch the current stream (for header matching).
+    private var session: NativePlayerSession?
+    private var resolutionTask: Task<Void, Never>?
+    private var streamRequestSerial = 0
+    private var rejectedClients: Set<String> = []
     private var currentStreamClient: StreamClient?
+    private var streamFetchTime: Date?
+    private var pendingSeek: TimeInterval?
+    private var lastReportedPosition: TimeInterval = 0
 
-    // MARK: - YTMusicPlayer State
+    private(set) var currentVideoId: String?
+    private(set) var currentAudioFormat: AudioFormatInfo?
+    private(set) var volume: Float = 1
+    private(set) var wantsPlayback = false
+    private(set) var isResolvingStream = false
+    private(set) var nativeStreamFetchCompletedAt: Date?
+    private(set) var hasActuallyStartedCurrentStream = false
+    private(set) var lastPlaybackProgressAt: Date?
 
-    var isPlaying: Bool {
-        session?.isPlaying ?? false
-    }
-
-    var audioFormatDescription: String? {
-        currentAudioFormat?.description
-    }
-
-    // MARK: - Initialization
-
-    init() {
-        setupRemoteCommandCenter()
-        setupNetworkMonitor()
-        logger.info("[Player: Native] YTMusicNativePlayer initialized")
-    }
-
-    private func setupNetworkMonitor() {
-        networkMonitor.pathUpdateHandler = { [weak self] path in
-            let isCellular = path.usesInterfaceType(.cellular)
-            Task { @MainActor [weak self] in
-                self?.isOnCellular = isCellular
-            }
-        }
-        networkMonitor.start(queue: DispatchQueue.global(qos: .utility))
-    }
-
-    // MARK: - Remote Command Center
-
-    private func setupRemoteCommandCenter() {
-        let commandCenter = MPRemoteCommandCenter.shared()
-
-        commandCenter.playCommand.isEnabled = true
-        commandCenter.playCommand.addTarget { [weak self] _ in
-            self?.play()
-            return .success
-        }
-
-        commandCenter.pauseCommand.isEnabled = true
-        commandCenter.pauseCommand.addTarget { [weak self] _ in
-            self?.pause()
-            return .success
-        }
-
-        commandCenter.togglePlayPauseCommand.isEnabled = true
-        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
-            if self?.isPlaying == true {
-                self?.pause()
-            } else {
-                self?.play()
-            }
-            return .success
-        }
-
-        commandCenter.changePlaybackPositionCommand.isEnabled = true
-        commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let event = event as? MPChangePlaybackPositionCommandEvent else {
-                return .commandFailed
-            }
-            self?.seek(to: event.positionTime)
-            return .success
-        }
-
-        self.logger.info("[Player: Native] Remote command center configured")
-    }
-
-    // MARK: - YTMusicPlayer
+    var isPlaying: Bool { session?.isPlaying ?? false }
+    var audioFormatDescription: String? { currentAudioFormat?.description }
 
     func loadVideo(videoId: String) async {
-        // Don't reload if same video
-        if videoId == currentVideoId, session != nil, !isStreamExpired() {
-            self.logger.info("[Player: Native] Video \(videoId) already loaded and stream valid")
-            play()
-            return
+        if currentVideoId == videoId, let session, let fetched = streamFetchTime,
+           Date().timeIntervalSince(fetched) < 5 * 60 * 60 {
+            if case .failed = session.status {
+                // A failed AVPlayerItem cannot be restarted by calling play().
+            } else {
+                play()
+                return
+            }
         }
-
-        self.logger.info("[Player: Native] Loading video: \(videoId)")
-        self.currentVideoId = videoId
+        stop()
+        currentVideoId = videoId
+        wantsPlayback = true
+        let serial = streamRequestSerial
         onStateChange?(.loading)
-
-        let result = await streamFetcher.fetchStream(videoId: videoId) { response in
-            response.bestHighQualityFormat()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.resolveStream(videoId: videoId, serial: serial)
         }
-
-        switch result {
-        case .success(let streamResult):
-            self.currentStreamURL = streamResult.streamURL
-            self.streamFetchTime = Date()
-            self.currentStreamClient = streamResult.client
-
-            self.currentAudioFormat = streamFetcher.makeAudioFormatInfo(
-                from: streamResult.format,
-                availableFormats: streamResult.audioFormats.count
-            )
-
-            let bitrateKbps = (streamResult.format.bitrate ?? 0) / 1000
-            let codec = StreamFetcher.parseCodec(from: streamResult.format.mimeType)
-            onAudioQualityChanged?(bitrateKbps, codec)
-
-            self.logger.info("[Player: Native] Playing: \(codec) \(bitrateKbps)kbps (itag=\(streamResult.format.itag), client: \(streamResult.client.name))")
-
-            // Create headers matching the client
-            let headers: [String: String] = [
-                "User-Agent": streamResult.client.userAgent,
-                "Origin": "https://www.youtube.com",
-                "Referer": "https://www.youtube.com/",
-            ]
-
-            // Create new session (replaces old one)
-            let newSession = NativePlayerSession(
-                url: streamResult.streamURL,
-                headers: headers,
-                apiDuration: streamResult.apiDuration
-            )
-            self.session = newSession
-
-            // Wire up session callbacks
-            newSession.onTimeUpdate = { [weak self] currentTime, duration, isPlaying in
-                self?.onPlaybackUpdate?(isPlaying, currentTime, duration)
-            }
-
-            newSession.onTrackEnded = { [weak self] in
-                self?.logger.info("[Player: Native] Session reported track ended")
-                self?.onStateChange?(.ended)
-                self?.onTrackEnded?()
-            }
-
-            newSession.onError = { [weak self] error in
-                guard let self else { return }
-                self.logger.warning("[Player: Native] Playback error occurred, skipping to next track")
-                self.onStateChange?(.error(error.localizedDescription))
-                self.onError?(error)
-                // Auto-skip to next track when playback fails
-                self.onTrackEnded?()
-            }
-
-            // Set volume and start playback
-            newSession.volume = volume
-            newSession.play()
-            onStateChange?(.playing)
-
-        case .failure(let error):
-            self.logger.error("[Player: Native] All clients failed, skipping track. Error: \(error.localizedDescription)")
-            onStateChange?(.ended)
-            onTrackEnded?()
+        resolutionTask = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
         }
     }
 
-    /// Loads and plays a pre-downloaded HLS asset for offline playback.
-    func loadAsset(_ asset: AVURLAsset) async {
-        self.logger.info("[Player: Native] Loading offline asset")
-        onStateChange?(.loading)
-
-        let newSession = NativePlayerSession(asset: asset)
-        self.session = newSession
-
-        newSession.onTimeUpdate = { [weak self] currentTime, duration, isPlaying in
-            self?.onPlaybackUpdate?(isPlaying, currentTime, duration)
+    private func resolveStream(videoId: String, serial: Int) async {
+        guard currentVideoId == videoId, streamRequestSerial == serial, !Task.isCancelled else { return }
+        isResolvingStream = true
+        nativeStreamFetchCompletedAt = nil
+        MixtapeNativeAudioTrace.add("native request #\(serial) resolving; excluded profiles=\(rejectedClients.count)")
+        let quality = UserDefaults.standard.string(forKey: "mixtape.ios18.streamingQuality") ?? "balanced"
+        let result = await streamFetcher.fetchStream(videoId: videoId, excludingClients: rejectedClients) {
+            $0.preferredNativeAudioFormat(quality: quality)
         }
+        guard currentVideoId == videoId, streamRequestSerial == serial, !Task.isCancelled else { return }
+        isResolvingStream = false
+        nativeStreamFetchCompletedAt = Date()
+        resolutionTask = nil
 
-        newSession.onTrackEnded = { [weak self] in
-            self?.logger.info("[Player: Native] Offline session track ended")
-            self?.onStateChange?(.ended)
-            self?.onTrackEnded?()
+        switch result {
+        case .success(let stream):
+            currentStreamClient = stream.client
+            streamFetchTime = Date()
+            currentAudioFormat = streamFetcher.makeAudioFormatInfo(from: stream.format, availableFormats: stream.audioFormats.count)
+            let bitrate = (stream.format.bitrate ?? 0) / 1000
+            let codec = StreamFetcher.parseCodec(from: stream.format.mimeType)
+            onAudioQualityChanged?(bitrate, codec)
+            MixtapeNativeAudioTrace.add("native AAC \(bitrate)kbps itag=\(stream.format.itag) profile=\(stream.client.name); URLSession ranges")
+            let newSession = NativePlayerSession(
+                url: stream.streamURL,
+                headers: [
+                    "User-Agent": stream.client.userAgent,
+                    "Origin": "https://www.youtube.com",
+                    "Referer": "https://www.youtube.com/",
+                ],
+                apiDuration: stream.apiDuration
+            )
+            installSession(newSession, videoId: videoId, serial: serial)
+        case .failure(let error):
+            // PlayerManager chooses an optional fallback for this same track.
+            // Preserve pause intent; a failure is never an ended-track event.
+            MixtapeNativeAudioTrace.add("native discovery failed \(MixtapeNativeAudioTrace.describe(error))")
+            onError?(error)
         }
+    }
 
-        newSession.onError = { [weak self] error in
-            guard let self else { return }
-            self.logger.warning("[Player: Native] Offline playback error: \(error.localizedDescription)")
-            self.onStateChange?(.error(error.localizedDescription))
-            self.onError?(error)
+    private func installSession(_ newSession: NativePlayerSession, videoId: String?, serial: Int) {
+        session?.pause()
+        session = newSession
+        hasActuallyStartedCurrentStream = false
+        lastPlaybackProgressAt = nil
+        lastReportedPosition = pendingSeek ?? 0
+
+        newSession.onTimeUpdate = { [weak self, weak newSession] time, duration, playing in
+            guard let self, let newSession, self.session === newSession,
+                  self.streamRequestSerial == serial else { return }
+            if playing && time > self.lastReportedPosition + 0.05 {
+                self.lastPlaybackProgressAt = Date()
+            }
+            self.lastReportedPosition = time
+            self.onPlaybackUpdate?(playing, time, duration)
+        }
+        newSession.onStatusChanged = { [weak self, weak newSession] status in
+            guard let self, let newSession, self.session === newSession,
+                  self.streamRequestSerial == serial else { return }
+            switch status {
+            case .ready:
+                MixtapeNativeAudioTrace.add("AVPlayer readyToPlay")
+            case .playing:
+                guard self.wantsPlayback else { newSession.pause(); return }
+                if !self.hasActuallyStartedCurrentStream {
+                    MixtapeNativeAudioTrace.add("AVPlayer PLAYING")
+                    self.lastPlaybackProgressAt = Date()
+                }
+                self.hasActuallyStartedCurrentStream = true
+                self.onStateChange?(.playing)
+            case .buffering:
+                if self.wantsPlayback { self.onStateChange?(.loading) }
+            case .paused:
+                if !self.wantsPlayback { self.onStateChange?(.paused) }
+            case .failed(let error):
+                MixtapeNativeAudioTrace.add("AVPlayer failed \(MixtapeNativeAudioTrace.describe(error))")
+            case .idle, .completed:
+                break
+            }
+        }
+        newSession.onTrackEnded = { [weak self, weak newSession] in
+            guard let self, let newSession, self.session === newSession,
+                  self.streamRequestSerial == serial else { return }
+            self.wantsPlayback = false
+            self.onStateChange?(.ended)
             self.onTrackEnded?()
         }
-
+        newSession.onError = { [weak self, weak newSession] error in
+            guard let self, let newSession, self.session === newSession,
+                  self.streamRequestSerial == serial else { return }
+            MixtapeNativeAudioTrace.add("native session error \(MixtapeNativeAudioTrace.describe(error))")
+            guard let videoId, let client = self.currentStreamClient else {
+                self.onError?(error)
+                return
+            }
+            self.retryFailedStream(videoId: videoId, serial: serial, client: client.name, error: error)
+        }
         newSession.volume = volume
-        newSession.play()
-        onStateChange?(.playing)
+        if let pendingSeek {
+            newSession.seek(to: pendingSeek)
+            self.pendingSeek = nil
+        }
+        if wantsPlayback { newSession.play() }
+        else { onStateChange?(.paused) }
+    }
+
+    /// Obtain a fresh URL from a different profile, never replay a rejected URL.
+    private func retryFailedStream(videoId: String, serial: Int, client: String, error: Error) {
+        guard resolutionTask == nil else { return }
+        rejectedClients.insert(client)
+        pendingSeek = max(pendingSeek ?? 0, session?.currentTime ?? 0)
+        session?.pause()
+        session = nil
+        if rejectedClients.count >= StreamClient.fallbackClients.count {
+            onError?(error)
+            return
+        }
+        if wantsPlayback { onStateChange?(.loading) }
+        resolutionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.resolveStream(videoId: videoId, serial: serial)
+        }
+    }
+
+    func loadAsset(_ asset: AVURLAsset) async {
+        stop()
+        wantsPlayback = true
+        onStateChange?(.loading)
+        installSession(NativePlayerSession(asset: asset), videoId: nil, serial: streamRequestSerial)
     }
 
     func play() {
-        self.logger.debug("[Player: Native] play()")
-        session?.play()
-        onStateChange?(.playing)
+        wantsPlayback = true
+        if let session, case .failed = session.status, let videoId = currentVideoId,
+           let client = currentStreamClient {
+            retryFailedStream(videoId: videoId, serial: streamRequestSerial, client: client.name,
+                              error: YTMusicError.playbackError(message: "The native audio session failed."))
+        } else {
+            session?.play()
+        }
+        // Actual AVPlayer events confirm playback, never the act of requesting it.
+        if isResolvingStream || session == nil { onStateChange?(.loading) }
     }
 
     func pause() {
-        self.logger.debug("[Player: Native] pause()")
+        wantsPlayback = false
         session?.pause()
         onStateChange?(.paused)
     }
 
     func seek(to time: TimeInterval) {
-        guard let session = session else {
-            self.logger.warning("[Player: Native] Cannot seek - no session")
-            return
-        }
-        self.logger.debug("[Player: Native] seek(to: \(time))")
-        session.seek(to: time)
+        guard time.isFinite else { return }
+        let target = max(0, time)
+        lastPlaybackProgressAt = Date()
+        lastReportedPosition = target
+        if let session { session.seek(to: target) }
+        else { pendingSeek = target }
     }
 
     func setVolume(_ volume: Float) {
-        let clampedVolume = max(0, min(1, volume))
-        self.volume = clampedVolume
-        self.logger.debug("[Player: Native] setVolume(\(clampedVolume))")
-        session?.volume = clampedVolume
+        guard volume.isFinite else { return }
+        self.volume = max(0, min(1, volume))
+        session?.volume = self.volume
     }
 
     func stop() {
-        self.logger.debug("[Player: Native] stop()")
-
-        // Session cleanup is handled by its deinit
+        streamRequestSerial += 1
+        resolutionTask?.cancel()
+        resolutionTask = nil
+        wantsPlayback = false
+        session?.pause()
         session = nil
-
         currentVideoId = nil
-        currentStreamURL = nil
-        streamFetchTime = nil
+        currentAudioFormat = nil
         currentStreamClient = nil
-
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        streamFetchTime = nil
+        pendingSeek = nil
+        rejectedClients.removeAll()
+        isResolvingStream = false
+        nativeStreamFetchCompletedAt = nil
+        hasActuallyStartedCurrentStream = false
+        lastPlaybackProgressAt = nil
     }
+}
 
-    func next() {
-        // Native player doesn't support next/previous directly
-        // Queue management is handled by PlayerManager
-    }
+/// Persist only status, timing and domains/codes: no media URL or credentials.
+@MainActor
+enum MixtapeNativeAudioTrace {
+    private static let key = "mixtape.ios18.v35.nativeTrace"
 
-    func previous() {
-        // Native player doesn't support next/previous directly
-        // Queue management is handled by PlayerManager
-    }
-
-    // MARK: - Private Helpers
-
-    /// Checks if the current stream URL has expired.
-    private func isStreamExpired() -> Bool {
-        guard let fetchTime = streamFetchTime else { return true }
-        return Date().timeIntervalSince(fetchTime) > streamExpirationBuffer
-    }
-
-    /// Refreshes the stream URL if expired.
-    private func refreshStreamIfNeeded() async {
-        guard let videoId = currentVideoId, isStreamExpired() else { return }
-
-        self.logger.info("[Player: Native] Refreshing expired stream for \(videoId)")
-
-        // Save current position
-        let savedPosition = session?.currentTime ?? 0
-
-        // Reload video (creates new session)
-        await loadVideo(videoId: videoId)
-
-        // Seek to saved position
-        if savedPosition > 0 {
-            session?.seek(to: savedPosition)
+    static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        var result = "\(ns.domain):\(ns.code)"
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            result += " underlying=\(underlying.domain):\(underlying.code)"
         }
+        return result
+    }
 
-        self.logger.info("[Player: Native] Stream refreshed, resumed at \(savedPosition)s")
+    static func add(_ message: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let safe = message.replacingOccurrences(of: #"https?://[^\s]+"#, with: "[URL]", options: .regularExpression)
+        var lines = (UserDefaults.standard.string(forKey: key) ?? "").split(separator: "\n").map(String.init)
+        lines.append("\(stamp) \(String(safe.prefix(220)))")
+        UserDefaults.standard.set(lines.suffix(75).joined(separator: "\n"), forKey: key)
     }
 }

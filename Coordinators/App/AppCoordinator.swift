@@ -167,7 +167,9 @@ final class AppCoordinator: HashableObject {
 
         Task {
             await authService.checkLoginStatus()
+            #if !IOS18_COMPAT
             await FoundationModelsService.shared.warmup()
+            #endif
         }
     }
 

@@ -290,10 +290,9 @@ final class VLCMusicPlayer: NSObject, YTMusicPlayer {
             onStateChange?(.playing)
 
         case .failure(let error):
-            logger.error("[Player: VLC] All clients failed, skipping track. Error: \(error.localizedDescription)")
+            logger.error("[Player: VLC] All clients failed. Error: \(error.localizedDescription)")
             onStateChange?(.error(error.localizedDescription))
             onError?(error)
-            onTrackEnded?()
         }
     }
 

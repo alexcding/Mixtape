@@ -6,6 +6,7 @@ import FoundationModels
 /// Represents a user's intent when using natural language music commands.
 /// The model generates this from free-form text like "play some jazz" or "skip this song".
 @Generable
+@available(iOS 26.0, *)
 struct MusicIntent: Sendable {
     /// The type of action the user wants to perform.
     @Guide(description: "The action to perform: play, queue, shuffle, like, dislike, skip, previous, pause, resume, search")
@@ -302,6 +303,7 @@ struct MusicIntent: Sendable {
 
 /// Actions that can be performed via natural language commands.
 @Generable
+@available(iOS 26.0, *)
 enum MusicAction: String, Sendable, CaseIterable {
     case play
     case queue
@@ -319,6 +321,7 @@ enum MusicAction: String, Sendable, CaseIterable {
 
 /// Hints about where to source content for the best results.
 /// Used to route requests to curated endpoints instead of search when appropriate.
+@available(iOS 26.0, *)
 enum ContentSource: String, Sendable, CustomStringConvertible {
     /// Use search API (default fallback)
     case search

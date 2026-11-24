@@ -2,65 +2,101 @@ import Foundation
 
 /// Parser for search responses from the API.
 enum SearchResponseParser {
-    /// Parses a search response.
+    /// Parses mixed YouTube Music search results across supported renderer layouts.
+    /// The result can be nested under tabs, shelves and Top Result cards.
     static func parse(_ data: [String: Any]) -> SearchResponse {
         var songs: [Song] = []
         var albums: [Album] = []
         var artists: [Artist] = []
         var playlists: [Playlist] = []
+        var seen = Set<String>()
 
-        // Navigate to contents
-        guard let contents = data["contents"] as? [String: Any],
-              let tabbedSearchResults = contents["tabbedSearchResultsRenderer"] as? [String: Any],
-              let tabs = tabbedSearchResults["tabs"] as? [[String: Any]],
-              let firstTab = tabs.first,
-              let tabRenderer = firstTab["tabRenderer"] as? [String: Any],
-              let tabContent = tabRenderer["content"] as? [String: Any],
-              let sectionListRenderer = tabContent["sectionListRenderer"] as? [String: Any],
-              let sectionContents = sectionListRenderer["contents"] as? [[String: Any]]
-        else {
-            return SearchResponse.empty
+        func append(_ item: SearchResultItem?) {
+            guard let item, seen.insert(item.id).inserted else { return }
+            switch item {
+            case let .song(song): songs.append(song)
+            case let .album(album): albums.append(album)
+            case let .artist(artist): artists.append(artist)
+            case let .playlist(playlist): playlists.append(playlist)
+            }
         }
 
-        for sectionData in sectionContents {
-            // Parse musicCardShelfRenderer (Top Result section)
-            if let cardShelfRenderer = sectionData["musicCardShelfRenderer"] as? [String: Any] {
-                if let item = parseCardShelfRenderer(cardShelfRenderer) {
-                    switch item {
-                    case let .song(song):
-                        songs.append(song)
-                    case let .album(album):
-                        albums.append(album)
-                    case let .artist(artist):
-                        artists.append(artist)
-                    case let .playlist(playlist):
-                        playlists.append(playlist)
-                    }
-                }
+        // Follow only known navigation/result keys; avoid walking unrelated
+        // metadata, authentication and menu trees.
+        func visit(_ node: Any, depth: Int) {
+            guard depth < 18 else { return }
+            if let nodes = node as? [Any] {
+                for child in nodes { visit(child, depth: depth + 1) }
+                return
+            }
+            guard let object = node as? [String: Any] else { return }
+
+            if let card = object["musicCardShelfRenderer"] as? [String: Any] {
+                append(parseCardShelfRenderer(card) ?? parseSongCardRenderer(card))
+            }
+            if object["musicResponsiveListItemRenderer"] != nil {
+                append(parseSearchResultItem(object))
+            }
+            if let twoRow = object["musicTwoRowItemRenderer"] as? [String: Any] {
+                append(parseTwoRowRenderer(twoRow))
             }
 
-            // Parse musicShelfRenderer (regular results)
-            if let shelfRenderer = sectionData["musicShelfRenderer"] as? [String: Any],
-               let shelfContents = shelfRenderer["contents"] as? [[String: Any]]
-            {
-                for itemData in shelfContents {
-                    if let item = parseSearchResultItem(itemData) {
-                        switch item {
-                        case let .song(song):
-                            songs.append(song)
-                        case let .album(album):
-                            albums.append(album)
-                        case let .artist(artist):
-                            artists.append(artist)
-                        case let .playlist(playlist):
-                            playlists.append(playlist)
-                        }
-                    }
+            for key in ["tabbedSearchResultsRenderer", "tabs", "tabRenderer",
+                        "content", "sectionListRenderer", "contents",
+                        "itemSectionRenderer", "musicShelfRenderer",
+                        "musicCardShelfRenderer", "musicCarouselShelfRenderer",
+                        "gridRenderer", "items"] {
+                if let child = object[key] {
+                    visit(child, depth: depth + 1)
                 }
             }
         }
 
+        visit(data["contents"] ?? data, depth: 0)
         return SearchResponse(songs: songs, albums: albums, artists: artists, playlists: playlists)
+    }
+
+    /// Top Result may be a directly playable song rather than a browse item.
+    private static func parseSongCardRenderer(_ card: [String: Any]) -> SearchResultItem? {
+        guard let titleData = card["title"] as? [String: Any],
+              let titleRuns = titleData["runs"] as? [[String: Any]],
+              let first = titleRuns.first,
+              let title = first["text"] as? String,
+              let endpoint = first["navigationEndpoint"] as? [String: Any],
+              let watchEndpoint = endpoint["watchEndpoint"] as? [String: Any],
+              let videoId = watchEndpoint["videoId"] as? String
+        else { return nil }
+
+        let thumbnails = ParsingHelpers.extractThumbnails(from: card)
+        let thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+        let song = Song(id: videoId, title: title, artists: [], album: nil,
+                        duration: nil, thumbnailURL: thumbnailURL, videoId: videoId)
+        return .song(song)
+    }
+
+    /// Albums and playlists may appear as two-row cards in newer responses.
+    private static func parseTwoRowRenderer(_ renderer: [String: Any]) -> SearchResultItem? {
+        guard let title = ParsingHelpers.extractTitle(from: renderer),
+              let endpoint = renderer["navigationEndpoint"] as? [String: Any],
+              let browse = endpoint["browseEndpoint"] as? [String: Any],
+              let browseId = browse["browseId"] as? String
+        else { return nil }
+
+        let thumbnails = ParsingHelpers.extractThumbnails(from: renderer)
+        let thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+        let pageType = extractPageType(from: browse)
+        if pageType == "MUSIC_PAGE_TYPE_ALBUM" || browseId.hasPrefix("MPRE") || browseId.hasPrefix("OLAK") {
+            return .album(Album(id: browseId, title: title, artists: nil,
+                                thumbnailURL: thumbnailURL, year: nil, trackCount: nil))
+        }
+        if pageType == "MUSIC_PAGE_TYPE_ARTIST" || browseId.hasPrefix("UC") {
+            return .artist(Artist(id: browseId, name: title, thumbnailURL: thumbnailURL))
+        }
+        if pageType == "MUSIC_PAGE_TYPE_PLAYLIST" || browseId.hasPrefix("VL") || browseId.hasPrefix("PL") {
+            return .playlist(Playlist(id: browseId, title: title, description: nil,
+                                      thumbnailURL: thumbnailURL, trackCount: nil, author: nil))
+        }
+        return nil
     }
 
     /// Parses a filtered songs-only search response.
@@ -161,9 +197,8 @@ enum SearchResponseParser {
             return nil
         }
 
-        // Try to get videoId for songs
-        if let playlistItemData = responsiveRenderer["playlistItemData"] as? [String: Any],
-           let videoId = playlistItemData["videoId"] as? String
+        // Video IDs can also be in watchEndpoint or thumbnail overlay.
+        if let videoId = ParsingHelpers.extractVideoId(from: responsiveRenderer)
         {
             return self.parseSongFromResponsiveRenderer(responsiveRenderer, videoId: videoId)
         }

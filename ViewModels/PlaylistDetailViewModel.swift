@@ -1,5 +1,7 @@
 import Foundation
+#if !IOS18_COMPAT
 import FoundationModels
+#endif
 import Observation
 import SwiftUI
 import SwiftUINavigation
@@ -404,6 +406,15 @@ final class PlaylistDetailViewModel: HashableObject {
     // MARK: - AI Refine
 
     /// Refines the playlist using AI based on user prompt.
+#if IOS18_COMPAT
+    // Refine is Apple Intelligence-only. Ordinary playlists, queues, music
+    // playback, downloads and library operations remain unchanged.
+    func refinePlaylist(prompt: String) async {
+        isRefining = false
+        refineError = "Apple Intelligence requires iOS 26"
+        playlistChanges = nil
+    }
+#else
     func refinePlaylist(prompt: String) async {
         guard let tracks = playlistDetail?.tracks else { return }
 
@@ -458,6 +469,7 @@ final class PlaylistDetailViewModel: HashableObject {
 
         isRefining = false
     }
+#endif
 
     /// Clears the refine state for retry.
     func clearRefineState() {

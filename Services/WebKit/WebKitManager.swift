@@ -159,45 +159,60 @@ final class WebKitManager: NSObject, WebKitManagerProtocol {
         // Observe cookie changes
         self.dataStore.httpCookieStore.add(self)
 
-        // Always restore auth cookies from Keychain backup on startup
-        // Keychain is our source of truth since WebKit storage can be unreliable
-        Task {
-            await self.restoreAuthCookiesFromBackup()
-        }
+        // iOS 18 crash hotfix: avoid the Swift async overlay for
+        // WKHTTPCookieStore.setCookie(_:) during application startup.
+        // Restore only when the persistent WebKit store lacks valid auth cookies.
+        self.restoreAuthCookiesFromBackup()
 
         self.logger.info("WebKitManager initialized with persistent data store")
     }
 
-    /// Restores auth cookies from Keychain backup to WebKit.
-    /// Keychain is the source of truth - always restore on startup.
-    private func restoreAuthCookiesFromBackup() async {
-        // Wait a moment for WebKit to fully initialize
-        try? await Task.sleep(for: .milliseconds(100))
+    /// Restore only missing auth cookies, without WebKit's Swift async wrapper.
+    /// The iOS 18 crash report shows a SIGSEGV while resuming the WebKit
+    /// SetCookie async continuation on the main thread. Completion handlers
+    /// avoid that specific continuation path.
+    private func restoreAuthCookiesFromBackup() {
+        let cookieStore = self.dataStore.httpCookieStore
+        cookieStore.getAllCookies { [weak self] existingCookies in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
 
-        let existingCookies = await dataStore.httpCookieStore.allCookies()
-        self.logger.info("WebKit has \(existingCookies.count) cookies on startup")
+                let now = Date()
+                let hasValidSession = existingCookies.contains { cookie in
+                    let isAuth = cookie.name == "SAPISID" ||
+                        cookie.name == "__Secure-3PAPISID"
+                    let isCurrent = cookie.expiresDate.map { $0 > now } ?? true
+                    return isAuth && isCurrent
+                }
 
-        // Always restore from backup if we have one
-        guard let backupCookies = CookieBackupManager.restoreCookies() else {
-            self.logger.info("No cookie backup found (first run or signed out)")
+                if hasValidSession {
+                    self.logger.info("WebKit already has valid YouTube cookies; no restore needed")
+                    return
+                }
+
+                guard let backupCookies = CookieBackupManager.restoreCookies(),
+                      !backupCookies.isEmpty else {
+                    self.logger.info("No backup auth cookies to restore")
+                    return
+                }
+
+                self.logger.info("Restoring auth cookies via WebKit completion handlers")
+                self.restoreCookieSequentially(backupCookies, index: 0)
+            }
+        }
+    }
+
+    /// Serial callback-based restore: no `await setCookie` continuation.
+    private func restoreCookieSequentially(_ cookies: [HTTPCookie], index: Int) {
+        guard index < cookies.count else {
+            self.logger.info("Completed cookie restoration")
             return
         }
 
-        self.logger.info("Restoring \(backupCookies.count) auth cookies from backup")
-
-        // Set each cookie in WebKit
-        for cookie in backupCookies {
-            await self.dataStore.httpCookieStore.setCookie(cookie)
-        }
-
-        // Verify restore
-        let cookies = await dataStore.httpCookieStore.allCookies()
-        let hasAuth = cookies.contains { $0.name == "SAPISID" || $0.name == "__Secure-3PAPISID" }
-
-        if hasAuth {
-            self.logger.info("✓ Auth cookies restored from backup (\(cookies.count) total cookies)")
-        } else {
-            self.logger.error("✗ Failed to restore auth cookies - backup may be corrupted")
+        self.dataStore.httpCookieStore.setCookie(cookies[index]) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.restoreCookieSequentially(cookies, index: index + 1)
+            }
         }
     }
 

@@ -211,7 +211,9 @@ final class SearchViewModel: HashableObject {
             // CancellationError is thrown when task is cancelled during URLSession request
             if !Task.isCancelled, self.query == currentQuery {
                 self.logger.error("Search failed: \(error.localizedDescription)")
-                self.loadingState = .error(LoadingError(from: error))
+                let nsError = error as NSError
+                let detail = "\(error.localizedDescription) [\(nsError.domain):\(nsError.code)]"
+                self.loadingState = .error(LoadingError(message: detail))
             }
         }
     }

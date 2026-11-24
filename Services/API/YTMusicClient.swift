@@ -313,7 +313,21 @@ final class YTMusicClient: YTMusicClientProtocol {
         ]
 
         let data = try await request("search", body: body)
-        let response = SearchResponseParser.parse(data)
+        guard let contents = data["contents"] as? [String: Any],
+              contents["tabbedSearchResultsRenderer"] != nil else {
+            throw YTMusicError.parseError(message: "Unexpected YouTube Music search response format")
+        }
+        var response = SearchResponseParser.parse(data)
+        if response.isEmpty && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // YouTube can change the mixed shelf layout independently of filtered search.
+            if let fallbackSongs = try? await searchSongs(query: query), !fallbackSongs.isEmpty {
+                self.logger.info("Mixed search parser empty; song-filter fallback returned \(fallbackSongs.count) items")
+                response = SearchResponse(songs: fallbackSongs, albums: [], artists: [], playlists: [])
+            } else {
+                let keys = (data["contents"] as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "none"
+                throw YTMusicError.parseError(message: "No supported search items in response. contents keys: \(keys)")
+            }
+        }
         self.logger.info("Search found \(response.songs.count) songs, \(response.albums.count) albums, \(response.artists.count) artists, \(response.playlists.count) playlists")
         return response
     }

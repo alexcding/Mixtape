@@ -51,6 +51,7 @@ struct TopSongsView: View {
             }
             .padding(.horizontal, 16)
         }
+        .mixtapeScrollAbovePlayer()
     }
 
     // MARK: - Song Row
@@ -94,6 +95,8 @@ struct TopSongsView: View {
             } label: {
                 Label("Add to Library", systemImage: "plus.circle")
             }
+
+            MixtapeQuickAddMenu(song: song)
 
             // Go to Album - show if album has valid browse ID
             if let album = song.album, album.hasNavigableId {
